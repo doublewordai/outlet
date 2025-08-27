@@ -1,15 +1,13 @@
 # Outlet
 
-A high-performance Axum middleware for capturing and correlating HTTP requests and responses with full streaming support.
+A high-performance Axum middleware for relaying axum requests & responses to a background thread for asynchronous processing, with full streaming support, and minimal performance overhead.
 
 ## Features
 
-- ✅ **Stream-aware**: Handles streaming request and response bodies without blocking
-- ✅ **Zero head-of-line blocking**: Never interferes with the natural request/response flow
-- ✅ **Request/Response correlation**: Matches requests with their corresponding responses using unique correlation IDs
-- ✅ **Configurable body capture**: Control whether to capture request/response bodies
-- ✅ **Background processing**: All capture and processing happens asynchronously
-- ✅ **Extensible**: Custom handlers for processing captured data
+- **Stream-aware**: Handles streaming request and response bodies without blocking
+- **Configurable body capture**: Control whether to capture request/response bodies
+- **Background processing**: All capture and processing happens asynchronously
+- **Extensible**: Custom handlers for processing captured data
 
 ## Quick Start
 
@@ -102,7 +100,7 @@ let layer = RequestLoggerLayer::new(config, handler);
 
 ## Custom Handlers
 
-Implement your own request/response processing logic:
+Implement the [`RequestHandler`] trait to create custom processing logic:
 
 ```rust
 use outlet::{RequestHandler, RequestData, ResponseData};
@@ -121,85 +119,8 @@ impl RequestHandler for CustomHandler {
         // Custom processing logic here  
     }
 }
-
-// Use with middleware
-let config = RequestLoggerConfig::default();
-let handler = CustomHandler;
-let layer = RequestLoggerLayer::new(config, handler);
 ```
 
-## Streaming Support
-
-The middleware fully supports streaming requests and responses:
-
-```rust
-use axum::{body::Body, response::Response};
-use futures::stream;
-use bytes::Bytes;
-
-async fn streaming_response() -> Response {
-    let stream = stream::iter(vec![
-        Ok::<_, std::convert::Infallible>(Bytes::from("chunk1\n")),
-        Ok(Bytes::from("chunk2\n")), 
-        Ok(Bytes::from("chunk3\n")),
-    ]);
-    
-    Response::builder()
-        .header("content-type", "text/plain")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-```
-
-The middleware will:
-
-- ✅ Capture each chunk as it flows through
-- ✅ Never block the stream waiting for completion  
-- ✅ Correlate the final assembled body with the original request
-- ✅ Handle backpressure correctly
-
-## Data Types
-
-### RequestData
-
-```rust
-pub struct RequestData {
-    pub correlation_id: u64,       // Unique request identifier
-    pub timestamp: SystemTime,     // When request was received
-    pub method: Method,            // HTTP method
-    pub uri: Uri,                  // Request URI
-    pub headers: HeaderMap,        // Request headers
-    pub body: Option<Bytes>,       // Request body (if captured)
-}
-```
-
-### ResponseData
-
-```rust
-pub struct ResponseData {
-    pub correlation_id: u64,       // Matches the request
-    pub timestamp: SystemTime,     // When response was sent
-    pub status: StatusCode,        // HTTP status code
-    pub headers: HeaderMap,        // Response headers  
-    pub body: Option<Bytes>,       // Response body (if captured)
-    pub duration: Duration,        // Time from request to response
-}
-```
-
-## Performance Characteristics
-
-- **Zero-copy streaming**: Bodies are streamed through without buffering the entire content
-- **Minimal latency impact**: Background processing doesn't block request handling
-- **Memory efficient**: Optional body capture and streaming design prevent unbounded memory usage
-- **High throughput**: Concurrent request handling with proper correlation
-
-## Use Cases
-
-- **API logging and monitoring**: Track all requests/responses through your API
-- **Audit trails**: Maintain detailed records of system interactions  
-- **Performance monitoring**: Measure request/response times and sizes
-- **Debugging**: Capture request/response data for troubleshooting
-- **Analytics**: Feed data to external analytics systems
 
 ## Running the Demo
 
