@@ -268,11 +268,11 @@ impl RequestLoggerLayer {
     /// };
     /// let handler = LoggingHandler;
     ///
-    /// Spawns the background task that runs the provided handler
+    /// // Spawns the background task that runs the provided handler
     /// let layer = RequestLoggerLayer::new(config, handler);
     ///
-    /// # use the layer anywhere you'd use a tower layer, and your handler will be called (in the
-    /// background) as each request traverses the layer.
+    /// // use the layer anywhere you'd use a tower layer, and your handler will be called (in the
+    /// // background) as each request traverses the layer.
     /// # }
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {

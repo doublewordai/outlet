@@ -7,7 +7,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::stream;
-use outlet::{types::*, RequestLoggerLayer, RequestLoggerConfig, RequestHandler};
+use outlet::{types::*, RequestHandler, RequestLoggerConfig, RequestLoggerLayer};
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
@@ -44,9 +44,11 @@ impl TestHandler {
 
     fn get_completed_pairs(&self) -> Vec<(u64, RequestData, ResponseData)> {
         let pairs = self.completed_pairs.lock().unwrap();
-        pairs.iter().map(|(id, (req, resp))| (*id, req.clone(), resp.clone())).collect()
+        pairs
+            .iter()
+            .map(|(id, (req, resp))| (*id, req.clone(), resp.clone()))
+            .collect()
     }
-
 
     fn wait_for_pairs(&self, expected_count: usize, timeout: Duration) -> bool {
         let start = SystemTime::now();
@@ -66,12 +68,18 @@ impl RequestHandler for TestHandler {
     }
 
     fn handle_response(&self, data: ResponseData, correlation_id: u64) {
-        self.responses.lock().unwrap().push((data.clone(), correlation_id));
-        
+        self.responses
+            .lock()
+            .unwrap()
+            .push((data.clone(), correlation_id));
+
         // Try to find matching request to create a completed pair
         let requests = self.requests.lock().unwrap();
         if let Some((req, _)) = requests.iter().find(|(_, id)| *id == correlation_id) {
-            self.completed_pairs.lock().unwrap().insert(correlation_id, (req.clone(), data));
+            self.completed_pairs
+                .lock()
+                .unwrap()
+                .insert(correlation_id, (req.clone(), data));
         }
     }
 }
@@ -176,7 +184,7 @@ async fn test_request_with_body_capture() {
     let (_correlation_id, request, response) = &pairs[0];
     assert_eq!(request.method, Method::POST);
     assert_eq!(request.uri.path(), "/echo");
-    
+
     // Check request body was captured
     assert!(request.body.is_some());
     assert_eq!(
@@ -216,7 +224,7 @@ async fn test_streaming_response_capture() {
 
     let (_correlation_id, _request, response) = &pairs[0];
     assert_eq!(response.status, StatusCode::OK);
-    
+
     // Check that streaming response was captured correctly
     assert!(response.body.is_some());
     assert_eq!(
@@ -238,7 +246,7 @@ async fn test_large_body_size_limit() {
 
     let response = server.get("/large").await;
     assert_eq!(response.status_code(), StatusCode::OK);
-    
+
     let full_response = response.text();
     assert_eq!(full_response.len(), 2048); // Full response should come through
 
@@ -250,7 +258,7 @@ async fn test_large_body_size_limit() {
     assert_eq!(pairs.len(), 1);
 
     let (_correlation_id, _request, response) = &pairs[0];
-    
+
     // Response body should be captured completely (no size limit anymore)
     if let Some(captured_body) = &response.body {
         assert_eq!(captured_body.len(), 2048); // Full response should be captured
@@ -271,22 +279,17 @@ async fn test_multiple_concurrent_requests() {
 
     // Send multiple concurrent requests using futures
     use futures::future::join_all;
-    
+
     let futures: Vec<_> = (0..5)
         .map(|i| {
             let server = server.clone();
-            async move {
-                server
-                    .post("/echo")
-                    .text(&format!("Request {}", i))
-                    .await
-            }
+            async move { server.post("/echo").text(&format!("Request {}", i)).await }
         })
         .collect();
-    
+
     // Wait for all requests to complete concurrently
     let responses = join_all(futures).await;
-    
+
     // Verify all responses are correct
     for (i, response) in responses.iter().enumerate() {
         assert_eq!(response.status_code(), StatusCode::OK);
@@ -307,11 +310,11 @@ async fn test_multiple_concurrent_requests() {
         assert_eq!(request.method, Method::POST);
         assert_eq!(request.uri.path(), "/echo");
         assert_eq!(response.status, StatusCode::OK);
-        
+
         // Verify body content matches
         assert!(request.body.is_some());
         assert!(response.body.is_some());
-        
+
         let request_body = String::from_utf8_lossy(request.body.as_ref().unwrap());
         let response_body = String::from_utf8_lossy(response.body.as_ref().unwrap());
         assert_eq!(response_body, format!("Echo: {}", request_body));
@@ -377,7 +380,7 @@ async fn test_empty_body_handling() {
     let (_correlation_id, request, response) = &pairs[0];
     // Empty request body should be handled gracefully
     assert!(request.body.is_none() || request.body.as_ref().unwrap().is_empty());
-    
+
     // Response should still be captured
     assert!(response.body.is_some());
     assert_eq!(
@@ -414,9 +417,18 @@ async fn test_correlation_isolation() {
     assert_eq!(pairs.len(), 3);
 
     // Verify each request type was handled correctly
-    let hello_pair = pairs.iter().find(|(_, req, _)| req.uri.path() == "/hello").unwrap();
-    let echo_pair = pairs.iter().find(|(_, req, _)| req.uri.path() == "/echo").unwrap();
-    let delayed_pair = pairs.iter().find(|(_, req, _)| req.uri.path() == "/delayed").unwrap();
+    let hello_pair = pairs
+        .iter()
+        .find(|(_, req, _)| req.uri.path() == "/hello")
+        .unwrap();
+    let echo_pair = pairs
+        .iter()
+        .find(|(_, req, _)| req.uri.path() == "/echo")
+        .unwrap();
+    let delayed_pair = pairs
+        .iter()
+        .find(|(_, req, _)| req.uri.path() == "/delayed")
+        .unwrap();
 
     assert_eq!(hello_pair.1.method, Method::GET);
     assert_eq!(echo_pair.1.method, Method::POST);
