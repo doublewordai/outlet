@@ -47,7 +47,7 @@ impl DemoHandler {
 }
 
 impl RequestHandler for DemoHandler {
-    fn handle_request(&self, data: RequestData, correlation_id: u64) {
+    async fn handle_request(&self, data: RequestData, correlation_id: u64) {
         let mut captured = self.captured_data.lock().unwrap();
         captured.push(CapturedRequest {
             correlation_id,
@@ -64,7 +64,7 @@ impl RequestHandler for DemoHandler {
         info!("Captured request: {} {}", data.method, data.uri);
     }
 
-    fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+    async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
         let mut captured = self.captured_data.lock().unwrap();
         if let Some(req) = captured
             .iter_mut()

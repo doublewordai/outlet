@@ -30,14 +30,14 @@
 //! }
 //!
 //! impl RequestHandler for MetricsHandler {
-//!     fn handle_request(&self, data: RequestData, _correlation_id: u64) {
+//!     async fn handle_request(&self, data: RequestData, _correlation_id: u64) {
 //!         // Count requests by endpoint
 //!         let endpoint = data.uri.path().to_string();
 //!         let mut stats = self.stats.lock().unwrap();
 //!         *stats.entry(endpoint).or_insert(0) += 1;
 //!     }
 //!
-//!     fn handle_response(&self, data: ResponseData, _correlation_id: u64) {
+//!     async fn handle_response(&self, data: ResponseData, _correlation_id: u64) {
 //!         // Log slow requests for monitoring
 //!         if data.duration.as_millis() > 1000 {
 //!             println!("SLOW REQUEST: {} took {}ms",
@@ -83,12 +83,12 @@
 //! struct CustomHandler;
 //!
 //! impl RequestHandler for CustomHandler {
-//!     fn handle_request(&self, data: RequestData, correlation_id: u64) {
+//!     async fn handle_request(&self, data: RequestData, correlation_id: u64) {
 //!         println!("Request: {} {}", data.method, data.uri);
 //!         // Custom processing logic here
 //!     }
 //!
-//!     fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+//!     async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
 //!         println!("Response: {} ({}ms)", data.status, data.duration.as_millis());
 //!         // Custom processing logic here  
 //!     }
@@ -160,7 +160,7 @@ impl Default for RequestLoggerConfig {
 /// Trait for handling captured request and response data.
 ///
 /// Implement this trait to create custom logic for processing HTTP requests and responses
-/// captured by the middleware. The trait provides separate methods for handling requests
+/// captured by the middleware. The trait provides separate async methods for handling requests
 /// and responses, both of which include a correlation ID to match them together.
 ///
 /// # Examples
@@ -173,11 +173,11 @@ impl Default for RequestLoggerConfig {
 /// struct MyHandler;
 ///
 /// impl RequestHandler for MyHandler {
-///     fn handle_request(&self, data: RequestData, correlation_id: u64) {
+///     async fn handle_request(&self, data: RequestData, correlation_id: u64) {
 ///         info!("Received {} request to {}", data.method, data.uri);
 ///     }
 ///
-///     fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+///     async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
 ///         info!("Sent {} response in {}ms",
 ///               data.status, data.duration.as_millis());
 ///     }
@@ -194,7 +194,11 @@ pub trait RequestHandler: Send + Sync + 'static {
     ///
     /// * `data` - The captured request data including method, URI, headers, and optionally body
     /// * `correlation_id` - A unique identifier for correlating this request with its response
-    fn handle_request(&self, data: RequestData, correlation_id: u64);
+    fn handle_request(
+        &self,
+        data: RequestData,
+        correlation_id: u64,
+    ) -> impl std::future::Future<Output = ()> + Send;
     /// Handle a captured HTTP response.
     ///
     /// This method is called when a response has been captured by the middleware.
@@ -205,7 +209,11 @@ pub trait RequestHandler: Send + Sync + 'static {
     ///
     /// * `data` - The captured response data including status, headers, body, and timing
     /// * `correlation_id` - The unique identifier that correlates with the original request
-    fn handle_response(&self, data: ResponseData, correlation_id: u64);
+    fn handle_response(
+        &self,
+        data: ResponseData,
+        correlation_id: u64,
+    ) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// Tower layer for the request logging middleware.
@@ -285,10 +293,14 @@ impl RequestLoggerLayer {
             while let Some(task) = rx.recv().await {
                 match task {
                     BackgroundTask::Request(data) => {
-                        handler_clone.handle_request(data.clone(), data.correlation_id);
+                        handler_clone
+                            .handle_request(data.clone(), data.correlation_id)
+                            .await;
                     }
                     BackgroundTask::Response(data) => {
-                        handler_clone.handle_response(data.clone(), data.correlation_id);
+                        handler_clone
+                            .handle_response(data.clone(), data.correlation_id)
+                            .await;
                     }
                 }
             }

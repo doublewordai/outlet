@@ -63,11 +63,11 @@ impl TestHandler {
 }
 
 impl RequestHandler for TestHandler {
-    fn handle_request(&self, data: RequestData, correlation_id: u64) {
+    async fn handle_request(&self, data: RequestData, correlation_id: u64) {
         self.requests.lock().unwrap().push((data, correlation_id));
     }
 
-    fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+    async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
         self.responses
             .lock()
             .unwrap()
