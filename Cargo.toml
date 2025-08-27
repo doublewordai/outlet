@@ -2,6 +2,12 @@
 name = "outlet"
 version = "0.1.0"
 edition = "2021"
+description = "HTTP request/response logging middleware for Axum with streaming support"
+license = "MIT"
+repository = "https://github.com/doublewordai/outlet"
+keywords = ["axum", "middleware", "logging", "http", "tracing"]
+categories = ["web-programming"]
+authors = ["fergus.finn@doubleword.ai"]
 
 [dependencies]
 axum = "0.8"
