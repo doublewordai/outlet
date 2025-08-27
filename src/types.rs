@@ -3,8 +3,9 @@
 //! This module contains the core data structures used to represent captured
 //! HTTP requests and responses, along with background task types.
 
-use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::http::{Method, StatusCode, Uri};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 /// Data captured from an HTTP request.
@@ -32,8 +33,8 @@ pub struct RequestData {
     pub method: Method,
     /// Request URI including path and query parameters
     pub uri: Uri,
-    /// HTTP request headers
-    pub headers: HeaderMap,
+    /// HTTP request headers as key-value pairs (values as raw bytes - no encoding guarantees)
+    pub headers: HashMap<String, Vec<Bytes>>,
     /// Request body bytes, if body capture is enabled and the body was successfully captured
     pub body: Option<Bytes>,
 }
@@ -61,8 +62,8 @@ pub struct ResponseData {
     pub timestamp: SystemTime,
     /// HTTP status code (200, 404, 500, etc.)
     pub status: StatusCode,
-    /// HTTP response headers
-    pub headers: HeaderMap,
+    /// HTTP request headers as key-value pairs (values as raw bytes - no encoding guarantees)
+    pub headers: HashMap<String, Vec<Bytes>>,
     /// Response body bytes, if body capture is enabled and the body was successfully captured
     pub body: Option<Bytes>,
     /// Time elapsed from when the request was received to when the response was sent

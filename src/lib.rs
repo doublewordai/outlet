@@ -97,6 +97,7 @@
 
 use axum::{body::Body, extract::Request, response::Response};
 use std::{
+    collections::HashMap,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -121,6 +122,21 @@ pub use logging_handler::LoggingHandler;
 
 /// Global atomic counter for correlation IDs
 static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Convert axum HeaderMap to HashMap<Bytes, Vec<Bytes>>
+fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes::Bytes>> {
+    let mut result = HashMap::new();
+    for (name, value) in headers {
+        let name_bytes = name.as_str().to_owned();
+        let value_bytes = bytes::Bytes::copy_from_slice(value.as_bytes());
+
+        result
+            .entry(name_bytes)
+            .or_insert_with(Vec::new)
+            .push(value_bytes);
+    }
+    result
+}
 
 /// Configuration for the request logging middleware.
 ///
@@ -396,7 +412,7 @@ where
                     timestamp: start_time,
                     method: method_clone,
                     uri: uri_clone,
-                    headers: headers_clone,
+                    headers: convert_headers(&headers_clone),
                     body,
                 };
 
@@ -413,7 +429,7 @@ where
                 timestamp: start_time,
                 method,
                 uri,
-                headers,
+                headers: convert_headers(&headers),
                 body: None,
             };
 
@@ -457,7 +473,7 @@ where
                                 correlation_id,
                                 timestamp: end_time,
                                 status: response_status,
-                                headers: response_headers,
+                                headers: convert_headers(&response_headers),
                                 body,
                                 duration,
                             };
@@ -474,7 +490,7 @@ where
                             correlation_id,
                             timestamp: end_time,
                             status: response_status,
-                            headers: response_headers,
+                            headers: convert_headers(&response_headers),
                             body: None,
                             duration,
                         };
