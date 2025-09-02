@@ -37,9 +37,9 @@ use crate::{RequestData, RequestHandler, ResponseData};
 pub struct LoggingHandler;
 
 impl RequestHandler for LoggingHandler {
-    async fn handle_request(&self, data: RequestData, correlation_id: u64) {
+    async fn handle_request(&self, data: RequestData) {
         info!(
-            correlation_id = %correlation_id,
+            correlation_id = %data.correlation_id,
             method = %data.method,
             uri = %data.uri,
             headers = ?data.headers,
@@ -48,13 +48,15 @@ impl RequestHandler for LoggingHandler {
         );
     }
 
-    async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+    async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
         info!(
-            correlation_id = %correlation_id,
-            status = %data.status,
-            headers = ?data.headers,
-            body_size = data.body.as_ref().map(|b| b.len()).unwrap_or(0),
-            duration_ms = data.duration.as_millis(),
+            correlation_id = %request_data.correlation_id,
+            method = %request_data.method,
+            uri = %request_data.uri,
+            status = %response_data.status,
+            headers = ?response_data.headers,
+            body_size = response_data.body.as_ref().map(|b| b.len()).unwrap_or(0),
+            duration_ms = response_data.duration.as_millis(),
             "Response captured"
         );
     }

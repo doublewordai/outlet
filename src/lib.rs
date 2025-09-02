@@ -30,18 +30,18 @@
 //! }
 //!
 //! impl RequestHandler for MetricsHandler {
-//!     async fn handle_request(&self, data: RequestData, _correlation_id: u64) {
+//!     async fn handle_request(&self, data: RequestData) {
 //!         // Count requests by endpoint
 //!         let endpoint = data.uri.path().to_string();
 //!         let mut stats = self.stats.lock().unwrap();
 //!         *stats.entry(endpoint).or_insert(0) += 1;
 //!     }
 //!
-//!     async fn handle_response(&self, data: ResponseData, _correlation_id: u64) {
+//!     async fn handle_response(&self, _request_data: RequestData, response_data: ResponseData) {
 //!         // Log slow requests for monitoring
-//!         if data.duration.as_millis() > 1000 {
+//!         if response_data.duration.as_millis() > 1000 {
 //!             println!("SLOW REQUEST: {} took {}ms",
-//!                      data.status, data.duration.as_millis());
+//!                      response_data.status, response_data.duration.as_millis());
 //!         }
 //!     }
 //! }
@@ -83,13 +83,13 @@
 //! struct CustomHandler;
 //!
 //! impl RequestHandler for CustomHandler {
-//!     async fn handle_request(&self, data: RequestData, correlation_id: u64) {
+//!     async fn handle_request(&self, data: RequestData) {
 //!         println!("Request: {} {}", data.method, data.uri);
 //!         // Custom processing logic here
 //!     }
 //!
-//!     async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
-//!         println!("Response: {} ({}ms)", data.status, data.duration.as_millis());
+//!     async fn handle_response(&self, _request_data: RequestData, response_data: ResponseData) {
+//!         println!("Response: {} ({}ms)", response_data.status, response_data.duration.as_millis());
 //!         // Custom processing logic here  
 //!     }
 //! }
@@ -120,8 +120,24 @@ use body_wrapper::create_body_capture_stream;
 pub mod logging_handler;
 pub use logging_handler::LoggingHandler;
 
-/// Global atomic counter for correlation IDs
+/// Global atomic counter for correlation IDs and process start timestamp
 static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PROCESS_START_TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Generate a unique correlation ID combining process start time and counter
+fn generate_correlation_id() -> u64 {
+    let start_time = *PROCESS_START_TIME.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    });
+
+    let counter = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // High 32 bits: process start timestamp, Low 32 bits: counter
+    (start_time << 32) | (counter & 0xFFFFFFFF)
+}
 
 /// Convert axum HeaderMap to HashMap<Bytes, Vec<Bytes>>
 fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes::Bytes>> {
@@ -189,13 +205,13 @@ impl Default for RequestLoggerConfig {
 /// struct MyHandler;
 ///
 /// impl RequestHandler for MyHandler {
-///     async fn handle_request(&self, data: RequestData, correlation_id: u64) {
+///     async fn handle_request(&self, data: RequestData) {
 ///         info!("Received {} request to {}", data.method, data.uri);
 ///     }
 ///
-///     async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+///     async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
 ///         info!("Sent {} response in {}ms",
-///               data.status, data.duration.as_millis());
+///               response_data.status, response_data.duration.as_millis());
 ///     }
 /// }
 /// ```
@@ -203,32 +219,25 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// Handle a captured HTTP request.
     ///
     /// This method is called when a request has been captured by the middleware.
-    /// The `correlation_id` can be used to match this request with its corresponding
-    /// response in [`handle_response`](Self::handle_response).
     ///
     /// # Arguments
     ///
     /// * `data` - The captured request data including method, URI, headers, and optionally body
-    /// * `correlation_id` - A unique identifier for correlating this request with its response
-    fn handle_request(
-        &self,
-        data: RequestData,
-        correlation_id: u64,
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn handle_request(&self, data: RequestData) -> impl std::future::Future<Output = ()> + Send;
     /// Handle a captured HTTP response.
     ///
     /// This method is called when a response has been captured by the middleware.
-    /// The `correlation_id` matches the one provided to [`handle_request`](Self::handle_request)
-    /// for the corresponding request.
+    /// The corresponding request data is provided to allow for correlation and
+    /// additional context during response processing.
     ///
     /// # Arguments
     ///
-    /// * `data` - The captured response data including status, headers, body, and timing
-    /// * `correlation_id` - The unique identifier that correlates with the original request
+    /// * `request_data` - The corresponding request data for context
+    /// * `response_data` - The captured response data including status, headers, body, and timing
     fn handle_response(
         &self,
-        data: ResponseData,
-        correlation_id: u64,
+        request_data: RequestData,
+        response_data: ResponseData,
     ) -> impl std::future::Future<Output = ()> + Send;
 }
 
@@ -309,13 +318,14 @@ impl RequestLoggerLayer {
             while let Some(task) = rx.recv().await {
                 match task {
                     BackgroundTask::Request(data) => {
-                        handler_clone
-                            .handle_request(data.clone(), data.correlation_id)
-                            .await;
+                        handler_clone.handle_request(data).await;
                     }
-                    BackgroundTask::Response(data) => {
+                    BackgroundTask::Response {
+                        request_data,
+                        response_data,
+                    } => {
                         handler_clone
-                            .handle_response(data.clone(), data.correlation_id)
+                            .handle_response(request_data, response_data)
                             .await;
                     }
                 }
@@ -369,7 +379,7 @@ where
 
     #[instrument(skip_all)]
     fn call(&mut self, mut request: Request) -> Self::Future {
-        let correlation_id = CORRELATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let correlation_id = generate_correlation_id();
         let start_time = SystemTime::now();
 
         debug!("Starting request processing");
@@ -379,66 +389,59 @@ where
         let uri = request.uri().clone();
         let headers = request.headers().clone();
 
-        debug!(method = %method, uri = %uri, "Extracted request metadata");
-
         let config = self.config.clone();
         let tx = self.tx.clone();
-        let tx_clone = tx.clone();
 
-        // Wrap the request body for streaming capture
-        if config.capture_request_body {
+        let method_clone = method.clone();
+        let uri_clone = uri.clone();
+        let headers_clone = headers.clone();
+        let tx_for_request = tx.clone();
+        let tx_for_response = tx.clone();
+
+        debug!(method = %method, uri = %uri, "Extracted request metadata");
+
+        // Setup request body capture based on config
+        let capture_future = if config.capture_request_body {
             debug!(correlation_id = %correlation_id, "Wrapping request body for capture");
             let body = std::mem::replace(request.body_mut(), Body::empty());
             let (body_stream, capture_future) = create_body_capture_stream(body);
             *request.body_mut() = body_stream;
             debug!(correlation_id = %correlation_id, "Request body capture stream created");
+            Some(capture_future)
+        } else {
+            None
+        };
 
-            // Spawn background task to collect captured body and send request data
-            let tx_clone = tx.clone();
-            let method_clone = method.clone();
-            let uri_clone = uri.clone();
-            let headers_clone = headers.clone();
-            tokio::spawn(async move {
-                let body = match capture_future.await {
+        let request_data_future = tokio::spawn(async move {
+            let body = if let Some(capture_future) = capture_future {
+                match capture_future.await {
                     Ok(captured_body) => Some(captured_body),
                     Err(e) => {
                         error!(correlation_id = %correlation_id, error = %e, "Error capturing request body");
-                        None
+                        return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                     }
-                };
-
-                let request_data = RequestData {
-                    correlation_id,
-                    timestamp: start_time,
-                    method: method_clone,
-                    uri: uri_clone,
-                    headers: convert_headers(&headers_clone),
-                    body,
-                };
-
-                if tx_clone
-                    .send(BackgroundTask::Request(request_data))
-                    .is_err()
-                {
-                    error!(correlation_id = %correlation_id, "Failed to send request data to background task");
                 }
-            });
-        } else {
+            } else {
+                None
+            };
+
             let request_data = RequestData {
                 correlation_id,
                 timestamp: start_time,
-                method,
-                uri,
-                headers: convert_headers(&headers),
-                body: None,
+                method: method_clone,
+                uri: uri_clone,
+                headers: convert_headers(&headers_clone),
+                body,
             };
 
-            if tx.send(BackgroundTask::Request(request_data)).is_err() {
-                error!("Failed to send request data to background task");
+            if let Err(e) = tx_for_request.send(BackgroundTask::Request(request_data.clone())) {
+                error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
+                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
-        }
 
-        debug!("Calling inner service");
+            Ok(request_data)
+        });
+
         let future = self.inner.call(request);
 
         Box::pin(async move {
@@ -453,55 +456,64 @@ where
                     let end_time = SystemTime::now();
                     let duration = end_time.duration_since(start_time).unwrap_or_default();
 
-                    if config.capture_response_body {
-                        // Wrap the response body for streaming capture
+                    // Setup response body capture based on config
+                    let capture_future = if config.capture_response_body {
+                        debug!(correlation_id = %correlation_id, "Wrapping response body for capture");
                         let body = std::mem::replace(response.body_mut(), Body::empty());
                         let (body_stream, capture_future) = create_body_capture_stream(body);
                         *response.body_mut() = body_stream;
+                        debug!(correlation_id = %correlation_id, "Response body capture stream created");
+                        Some(capture_future)
+                    } else {
+                        None
+                    };
 
-                        // Spawn task to capture response body
-                        tokio::spawn(async move {
-                            let body = match capture_future.await {
+                    // The future that outlives the request/response lifecycle
+                    tokio::spawn(async move {
+                        // Await request data future completion first
+                        let request_data = match request_data_future.await {
+                            Ok(Ok(data)) => data,
+                            Ok(Err(e)) => {
+                                error!(correlation_id = %correlation_id, error = %e, "Error processing request data");
+                                return; // Early return if we can't process request data
+                            }
+                            Err(e) => {
+                                error!(correlation_id = %correlation_id, error = %e, "Error retrieving request data");
+                                return; // Early return if we can't get request data
+                            }
+                        };
+
+                        let body = if let Some(capture_future) = capture_future {
+                            match capture_future.await {
                                 Ok(captured_body) => Some(captured_body),
                                 Err(e) => {
-                                    error!(error = %e, "Error capturing response body");
+                                    error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
                                     None
                                 }
-                            };
-
-                            let response_data = ResponseData {
-                                correlation_id,
-                                timestamp: end_time,
-                                status: response_status,
-                                headers: convert_headers(&response_headers),
-                                body,
-                                duration,
-                            };
-
-                            if tx_clone
-                                .send(BackgroundTask::Response(response_data))
-                                .is_err()
-                            {
-                                error!("Failed to send response data to background task");
                             }
-                        });
-                    } else {
+                        } else {
+                            None
+                        };
+
                         let response_data = ResponseData {
                             correlation_id,
                             timestamp: end_time,
                             status: response_status,
                             headers: convert_headers(&response_headers),
-                            body: None,
+                            body,
                             duration,
                         };
 
-                        if tx_clone
-                            .send(BackgroundTask::Response(response_data))
+                        if tx_for_response
+                            .send(BackgroundTask::Response {
+                                request_data,
+                                response_data,
+                            })
                             .is_err()
                         {
-                            error!("Failed to send response data to background task");
+                            error!(correlation_id = %correlation_id, "Failed to send response data to background task");
                         }
-                    }
+                    });
 
                     Ok(response)
                 }

@@ -47,10 +47,10 @@ impl DemoHandler {
 }
 
 impl RequestHandler for DemoHandler {
-    async fn handle_request(&self, data: RequestData, correlation_id: u64) {
+    async fn handle_request(&self, data: RequestData) {
         let mut captured = self.captured_data.lock().unwrap();
         captured.push(CapturedRequest {
-            correlation_id,
+            correlation_id: data.correlation_id,
             method: data.method.to_string(),
             uri: data.uri.to_string(),
             request_body: data
@@ -64,30 +64,30 @@ impl RequestHandler for DemoHandler {
         info!("Captured request: {} {}", data.method, data.uri);
     }
 
-    async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+    async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
         let mut captured = self.captured_data.lock().unwrap();
         if let Some(req) = captured
             .iter_mut()
-            .find(|r| r.correlation_id == correlation_id)
+            .find(|r| r.correlation_id == request_data.correlation_id)
         {
-            req.response_status = Some(data.status.as_u16());
-            req.response_body = data
+            req.response_status = Some(response_data.status.as_u16());
+            req.response_body = response_data
                 .body
                 .map(|b| String::from_utf8_lossy(b.as_ref()).to_string());
-            req.duration_ms = Some(data.duration.as_millis() as u64);
+            req.duration_ms = Some(response_data.duration.as_millis() as u64);
             req.completed = true;
             info!(
                 "Completed request/response pair: {} {} -> {} ({}ms)",
                 req.method,
                 req.uri,
-                data.status,
-                data.duration.as_millis()
+                response_data.status,
+                response_data.duration.as_millis()
             );
         } else {
             info!(
                 "Orphaned response: {} ({}ms)",
-                data.status,
-                data.duration.as_millis()
+                response_data.status,
+                response_data.duration.as_millis()
             );
         }
     }

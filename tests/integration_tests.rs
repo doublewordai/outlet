@@ -63,24 +63,24 @@ impl TestHandler {
 }
 
 impl RequestHandler for TestHandler {
-    async fn handle_request(&self, data: RequestData, correlation_id: u64) {
-        self.requests.lock().unwrap().push((data, correlation_id));
+    async fn handle_request(&self, data: RequestData) {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((data.clone(), data.correlation_id));
     }
 
-    async fn handle_response(&self, data: ResponseData, correlation_id: u64) {
+    async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
         self.responses
             .lock()
             .unwrap()
-            .push((data.clone(), correlation_id));
+            .push((response_data.clone(), request_data.correlation_id));
 
-        // Try to find matching request to create a completed pair
-        let requests = self.requests.lock().unwrap();
-        if let Some((req, _)) = requests.iter().find(|(_, id)| *id == correlation_id) {
-            self.completed_pairs
-                .lock()
-                .unwrap()
-                .insert(correlation_id, (req.clone(), data));
-        }
+        // Create a completed pair
+        self.completed_pairs
+            .lock()
+            .unwrap()
+            .insert(request_data.correlation_id, (request_data, response_data));
     }
 }
 
@@ -135,7 +135,6 @@ async fn test_basic_request_response() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -164,7 +163,6 @@ async fn test_request_with_body_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -172,7 +170,7 @@ async fn test_request_with_body_capture() {
     let test_body = "Hello, World!";
     let response = server.post("/echo").text(test_body).await;
     assert_eq!(response.status_code(), StatusCode::OK);
-    assert_eq!(response.text(), format!("Echo: {}", test_body));
+    assert_eq!(response.text(), format!("Echo: {test_body}"));
 
     // Wait for background processing
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -196,7 +194,7 @@ async fn test_request_with_body_capture() {
     assert!(response.body.is_some());
     assert_eq!(
         String::from_utf8_lossy(response.body.as_ref().unwrap()),
-        format!("Echo: {}", test_body)
+        format!("Echo: {test_body}")
     );
 }
 
@@ -206,7 +204,6 @@ async fn test_streaming_response_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -239,7 +236,6 @@ async fn test_large_body_size_limit() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -272,7 +268,6 @@ async fn test_multiple_concurrent_requests() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = std::sync::Arc::new(axum_test::TestServer::new(app).unwrap());
@@ -283,7 +278,7 @@ async fn test_multiple_concurrent_requests() {
     let futures: Vec<_> = (0..5)
         .map(|i| {
             let server = server.clone();
-            async move { server.post("/echo").text(&format!("Request {}", i)).await }
+            async move { server.post("/echo").text(format!("Request {i}")).await }
         })
         .collect();
 
@@ -293,7 +288,7 @@ async fn test_multiple_concurrent_requests() {
     // Verify all responses are correct
     for (i, response) in responses.iter().enumerate() {
         assert_eq!(response.status_code(), StatusCode::OK);
-        assert_eq!(response.text(), format!("Echo: Request {}", i));
+        assert_eq!(response.text(), format!("Echo: Request {i}"));
     }
 
     // Wait for background processing of all pairs
@@ -317,7 +312,7 @@ async fn test_multiple_concurrent_requests() {
 
         let request_body = String::from_utf8_lossy(request.body.as_ref().unwrap());
         let response_body = String::from_utf8_lossy(response.body.as_ref().unwrap());
-        assert_eq!(response_body, format!("Echo: {}", request_body));
+        assert_eq!(response_body, format!("Echo: {request_body}"));
     }
 }
 
@@ -327,7 +322,6 @@ async fn test_timing_accuracy() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -361,7 +355,6 @@ async fn test_empty_body_handling() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -395,7 +388,6 @@ async fn test_correlation_isolation() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -452,7 +444,6 @@ async fn test_config_disable_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
-        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();

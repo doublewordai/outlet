@@ -80,6 +80,10 @@ pub struct ResponseData {
 pub enum BackgroundTask {
     /// A request has been captured and is ready for processing
     Request(RequestData),
-    /// A response has been captured and is ready for processing
-    Response(ResponseData),
+    /// A response has been captured and is ready for processing.
+    /// Contains both the request and response data to provide full context.
+    Response {
+        request_data: RequestData,
+        response_data: ResponseData,
+    },
 }
