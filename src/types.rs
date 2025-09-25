@@ -66,7 +66,11 @@ pub struct ResponseData {
     pub headers: HashMap<String, Vec<Bytes>>,
     /// Response body bytes, if body capture is enabled and the body was successfully captured
     pub body: Option<Bytes>,
-    /// Time elapsed from when the request was received to when the response was sent
+    /// Time elapsed from when the request was received to when response headers were ready
+    pub duration_to_first_byte: Duration,
+    /// Total time elapsed from request start to completion of response stream.
+    /// For non-streaming responses, this equals duration_to_first_byte.
+    /// For streaming responses, this is the time until the stream fully completes.
     pub duration: Duration,
 }
 
