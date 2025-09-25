@@ -453,8 +453,10 @@ where
                 Ok(mut response) => {
                     let response_headers = response.headers().clone();
                     let response_status = response.status();
-                    let end_time = SystemTime::now();
-                    let duration = end_time.duration_since(start_time).unwrap_or_default();
+                    let first_byte_time = SystemTime::now();
+                    let duration_to_first_byte = first_byte_time
+                        .duration_since(start_time)
+                        .unwrap_or_default();
 
                     // Setup response body capture based on config
                     let capture_future = if config.capture_response_body {
@@ -483,25 +485,33 @@ where
                             }
                         };
 
-                        let body = if let Some(capture_future) = capture_future {
+                        let (body, total_duration) = if let Some(capture_future) = capture_future {
                             match capture_future.await {
-                                Ok(captured_body) => Some(captured_body),
+                                Ok(captured_body) => {
+                                    let stream_completion_time = SystemTime::now();
+                                    let total_duration = stream_completion_time
+                                        .duration_since(start_time)
+                                        .unwrap_or_default();
+                                    (Some(captured_body), total_duration)
+                                }
                                 Err(e) => {
                                     error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
-                                    None
+                                    (None, duration_to_first_byte)
                                 }
                             }
                         } else {
-                            None
+                            // No streaming - total duration equals first byte duration
+                            (None, duration_to_first_byte)
                         };
 
                         let response_data = ResponseData {
                             correlation_id,
-                            timestamp: end_time,
+                            timestamp: first_byte_time,
                             status: response_status,
                             headers: convert_headers(&response_headers),
                             body,
-                            duration,
+                            duration_to_first_byte,
+                            duration: total_duration,
                         };
 
                         if tx_for_response
