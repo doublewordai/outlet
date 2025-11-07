@@ -135,6 +135,7 @@ async fn test_basic_request_response() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -163,6 +164,7 @@ async fn test_request_with_body_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -204,6 +206,7 @@ async fn test_streaming_response_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -236,6 +239,7 @@ async fn test_large_body_size_limit() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -268,6 +272,7 @@ async fn test_multiple_concurrent_requests() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = std::sync::Arc::new(axum_test::TestServer::new(app).unwrap());
@@ -322,6 +327,7 @@ async fn test_timing_accuracy() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -355,6 +361,7 @@ async fn test_empty_body_handling() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -388,6 +395,7 @@ async fn test_correlation_isolation() {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -444,6 +452,7 @@ async fn test_config_disable_capture() {
     let config = RequestLoggerConfig {
         capture_request_body: false,
         capture_response_body: false,
+        path_filter: None,
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();

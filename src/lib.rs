@@ -170,6 +170,7 @@ fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes
 /// let config = RequestLoggerConfig {
 ///     capture_request_body: true,
 ///     capture_response_body: false,
+///     path_filter: None,
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -178,6 +179,22 @@ pub struct RequestLoggerConfig {
     pub capture_request_body: bool,
     /// Whether to capture response bodies
     pub capture_response_body: bool,
+    /// Optional path filter to skip body capture for requests that don't match
+    pub path_filter: Option<PathFilter>,
+}
+
+/// Filter configuration for determining which requests to capture.
+///
+/// When configured, the middleware will check this filter BEFORE capturing
+/// request/response bodies, avoiding memory overhead for filtered requests.
+#[derive(Clone, Debug)]
+pub struct PathFilter {
+    /// Only capture requests whose URI path starts with any of these prefixes.
+    /// If empty, all requests are captured (subject to blocked_prefixes).
+    pub allowed_prefixes: Vec<String>,
+    /// Skip requests whose URI path starts with any of these prefixes.
+    /// Takes precedence over allowed_prefixes.
+    pub blocked_prefixes: Vec<String>,
 }
 
 impl Default for RequestLoggerConfig {
@@ -185,7 +202,34 @@ impl Default for RequestLoggerConfig {
         Self {
             capture_request_body: true,
             capture_response_body: true,
+            path_filter: None,
         }
+    }
+}
+
+impl PathFilter {
+    /// Check if a URI path should be captured based on this filter.
+    ///
+    /// Returns `true` if the request should be captured, `false` if it should be skipped.
+    pub fn should_capture(&self, uri: &axum::http::Uri) -> bool {
+        let path = uri.path();
+
+        // Check blocked prefixes first (they take precedence)
+        for blocked_prefix in &self.blocked_prefixes {
+            if path.starts_with(blocked_prefix) {
+                return false;
+            }
+        }
+
+        // If no allowed prefixes specified, allow everything (after blocked check)
+        if self.allowed_prefixes.is_empty() {
+            return true;
+        }
+
+        // Check if URI matches any allowed prefix
+        self.allowed_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
     }
 }
 
@@ -298,6 +342,7 @@ impl RequestLoggerLayer {
     /// let config = RequestLoggerConfig {
     ///     capture_request_body: true,
     ///     capture_response_body: true,
+    ///     path_filter: None,
     /// };
     /// let handler = LoggingHandler;
     ///
@@ -379,6 +424,16 @@ where
 
     #[instrument(skip_all)]
     fn call(&mut self, mut request: Request) -> Self::Future {
+        // Check filter FIRST - if filtered, pass through immediately with zero overhead
+        if let Some(ref filter) = self.config.path_filter {
+            if !filter.should_capture(request.uri()) {
+                debug!(uri = %request.uri(), "Skipping request due to path filter");
+                let future = self.inner.call(request);
+                return Box::pin(future);
+            }
+        }
+
+        // Request passes filter - proceed with full processing
         let correlation_id = generate_correlation_id();
         let start_time = SystemTime::now();
 
@@ -400,7 +455,7 @@ where
 
         debug!(method = %method, uri = %uri, "Extracted request metadata");
 
-        // Setup request body capture based on config
+        // Setup request body capture
         let capture_future = if config.capture_request_body {
             debug!(correlation_id = %correlation_id, "Wrapping request body for capture");
             let body = std::mem::replace(request.body_mut(), Body::empty());
@@ -458,7 +513,7 @@ where
                         .duration_since(start_time)
                         .unwrap_or_default();
 
-                    // Setup response body capture based on config
+                    // Setup response body capture
                     let capture_future = if config.capture_response_body {
                         debug!(correlation_id = %correlation_id, "Wrapping response body for capture");
                         let body = std::mem::replace(response.body_mut(), Body::empty());

@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let config = RequestLoggerConfig {
         capture_request_body: true,
         capture_response_body: true,
+        path_filter: None,
     };
 
     // Build the router with middleware
