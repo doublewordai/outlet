@@ -108,7 +108,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tower::{Layer, Service};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, trace};
 
 pub mod types;
 use types::BackgroundTask;
@@ -437,8 +437,6 @@ where
         let correlation_id = generate_correlation_id();
         let start_time = SystemTime::now();
 
-        debug!("Starting request processing");
-
         // Extract request metadata
         let method = request.method().clone();
         let uri = request.uri().clone();
@@ -453,15 +451,15 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
-        debug!(method = %method, uri = %uri, "Extracted request metadata");
+        trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
         // Setup request body capture
         let capture_future = if config.capture_request_body {
-            debug!(correlation_id = %correlation_id, "Wrapping request body for capture");
+            trace!(correlation_id = %correlation_id, "Wrapping request body for capture");
             let body = std::mem::replace(request.body_mut(), Body::empty());
             let (body_stream, capture_future) = create_body_capture_stream(body);
             *request.body_mut() = body_stream;
-            debug!(correlation_id = %correlation_id, "Request body capture stream created");
+            trace!(correlation_id = %correlation_id, "Request body capture stream created");
             Some(capture_future)
         } else {
             None
@@ -500,9 +498,9 @@ where
         let future = self.inner.call(request);
 
         Box::pin(async move {
-            debug!("Awaiting inner service response");
+            trace!("Awaiting inner service response");
             let result = future.await;
-            debug!("Inner service response received");
+            trace!("Inner service response received");
 
             match result {
                 Ok(mut response) => {
@@ -515,11 +513,11 @@ where
 
                     // Setup response body capture
                     let capture_future = if config.capture_response_body {
-                        debug!(correlation_id = %correlation_id, "Wrapping response body for capture");
+                        trace!(correlation_id = %correlation_id, "Wrapping response body for capture");
                         let body = std::mem::replace(response.body_mut(), Body::empty());
                         let (body_stream, capture_future) = create_body_capture_stream(body);
                         *response.body_mut() = body_stream;
-                        debug!(correlation_id = %correlation_id, "Response body capture stream created");
+                        trace!(correlation_id = %correlation_id, "Response body capture stream created");
                         Some(capture_future)
                     } else {
                         None
