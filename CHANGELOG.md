@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/doublewordai/outlet/compare/v0.4.2...v0.4.3) - 2025-11-27
+
+### Other
+
+- *(deps)* update rust crate flamegraph to v0.6.10
+- Merge pull request #10 from doublewordai/renovate/anyhow-1.x-lockfile
+- *(deps)* update rust crate axum to v0.8.7
+- Add renovate.json
+- docs
+
 ## [0.4.2](https://github.com/doublewordai/outlet/compare/v0.4.1...v0.4.2) - 2025-11-11
 
 ### Fixed
