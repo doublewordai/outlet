@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/doublewordai/outlet/compare/v0.4.2...v0.4.3) - 2026-01-07
+
+### Added
+
+- add queue depth metrics
+
+### Other
+
+- Merge pull request #18 from doublewordai/renovate/tokio-tracing-monorepo
+- Merge pull request #15 from doublewordai/renovate/thiserror-2.x-lockfile
+- Merge pull request #17 from doublewordai/renovate/tower-http-0.x-lockfile
+- Merge pull request #16 from doublewordai/renovate/tokio-util-0.x-lockfile
+- Merge pull request #22 from doublewordai/renovate/hyper-1.x-lockfile
+- *(deps)* update rust crate hyper to v1.8.1
+- *(deps)* update rust crate flamegraph to v0.6.10
+- Merge pull request #10 from doublewordai/renovate/anyhow-1.x-lockfile
+- *(deps)* update rust crate axum to v0.8.7
+- Add renovate.json
+- docs
+
 ## [0.4.2](https://github.com/doublewordai/outlet/compare/v0.4.1...v0.4.2) - 2025-11-11
 
 ### Fixed
