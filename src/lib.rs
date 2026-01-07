@@ -109,6 +109,7 @@ use std::{
 use tokio::sync::mpsc;
 use tower::{Layer, Service};
 use tracing::{debug, error, instrument, trace};
+use metrics::counter;
 
 pub mod types;
 use types::BackgroundTask;
@@ -361,6 +362,7 @@ impl RequestLoggerLayer {
         // Spawn the background task
         tokio::spawn(async move {
             while let Some(task) = rx.recv().await {
+                counter!("outlet_queue_dequeued_total").increment(1);
                 match task {
                     BackgroundTask::Request(data) => {
                         handler_clone.handle_request(data).await;
@@ -491,6 +493,7 @@ where
                 error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
+            counter!("outlet_queue_enqueued_total").increment(1);
 
             Ok(request_data)
         });
@@ -575,6 +578,8 @@ where
                             .is_err()
                         {
                             error!(correlation_id = %correlation_id, "Failed to send response data to background task");
+                        } else {
+                            counter!("outlet_queue_enqueued_total").increment(1);
                         }
                     });
 

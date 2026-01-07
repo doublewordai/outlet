@@ -27,6 +27,7 @@ pin-project-lite = "0.2"
 thiserror = "2.0"
 async-stream = "0.3"
 anyhow = "1.0"
+metrics = "0.24"
 
 [dev-dependencies]
 tower-test = "0.4"
