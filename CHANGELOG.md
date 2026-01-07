@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Merge pull request #19 from doublewordai/renovate/uuid-1.x-lockfile
+- Merge pull request #20 from doublewordai/renovate/bytes-1.x-lockfile
+- Merge pull request #14 from doublewordai/renovate/serde_json-1.x-lockfile
 - Merge pull request #18 from doublewordai/renovate/tokio-tracing-monorepo
 - Merge pull request #15 from doublewordai/renovate/thiserror-2.x-lockfile
 - Merge pull request #17 from doublewordai/renovate/tower-http-0.x-lockfile
