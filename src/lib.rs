@@ -96,6 +96,7 @@
 //! ```
 
 use axum::{body::Body, extract::Request, response::Response};
+use metrics::counter;
 use std::{
     collections::HashMap,
     pin::Pin,
@@ -109,7 +110,6 @@ use std::{
 use tokio::sync::mpsc;
 use tower::{Layer, Service};
 use tracing::{debug, error, instrument, trace};
-use metrics::counter;
 
 pub mod types;
 use types::BackgroundTask;
