@@ -107,7 +107,7 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tower::{Layer, Service};
 use tracing::{debug, error, instrument, trace};
 
@@ -359,21 +359,52 @@ impl RequestLoggerLayer {
         let handler = Arc::new(handler);
         let handler_clone = handler.clone();
 
-        // Spawn the background task
+        // Spawn the background task with concurrent handler execution via JoinSet
+        // Unlike FuturesUnordered, JoinSet spawns tasks onto the executor independently,
+        // avoiding implicit sequencing that could cause deadlocks with shared resources.
         tokio::spawn(async move {
-            while let Some(task) = rx.recv().await {
-                counter!("outlet_queue_dequeued_total").increment(1);
-                match task {
-                    BackgroundTask::Request(data) => {
-                        handler_clone.handle_request(data).await;
+            let mut join_set = JoinSet::new();
+
+            loop {
+                tokio::select! {
+                    // Reap completed tasks to prevent unbounded growth
+                    Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                        if let Err(e) = result {
+                            error!("Handler task panicked: {}", e);
+                        }
                     }
-                    BackgroundTask::Response {
-                        request_data,
-                        response_data,
-                    } => {
-                        handler_clone
-                            .handle_response(request_data, response_data)
-                            .await;
+                    // Accept new tasks from the channel
+                    task = rx.recv() => {
+                        match task {
+                            Some(task) => {
+                                counter!("outlet_queue_dequeued_total").increment(1);
+                                let handler = handler_clone.clone();
+                                join_set.spawn(async move {
+                                    match task {
+                                        BackgroundTask::Request(data) => {
+                                            handler.handle_request(data).await;
+                                        }
+                                        BackgroundTask::Response {
+                                            request_data,
+                                            response_data,
+                                        } => {
+                                            handler
+                                                .handle_response(request_data, response_data)
+                                                .await;
+                                        }
+                                    }
+                                });
+                            }
+                            None => {
+                                // Channel closed, wait for remaining handlers to complete
+                                while let Some(result) = join_set.join_next().await {
+                                    if let Err(e) = result {
+                                        error!("Handler task panicked: {}", e);
+                                    }
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
             }
