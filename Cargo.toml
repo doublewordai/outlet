@@ -31,7 +31,7 @@ metrics = "0.24"
 
 [dev-dependencies]
 tower-test = "0.4"
-axum-test = "17.0"
+axum-test = "18.0"
 tokio-test = "0.4"
 hyper = "1.0"
 tracing-test = "0.2"
