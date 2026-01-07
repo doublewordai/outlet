@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/doublewordai/outlet/compare/v0.4.4...v0.4.5) - 2026-01-07
+
+### Other
+
+- *(deps)* update rust crate criterion to 0.8
+- Merge pull request #24 from doublewordai/renovate/axum-monorepo
+- Merge pull request #25 from doublewordai/renovate/tokio-test-0.x-lockfile
+- Merge pull request #27 from doublewordai/release-plz-2026-01-07T07-52-39Z
+
 ## [0.4.4](https://github.com/doublewordai/outlet/compare/v0.4.3...v0.4.4) - 2026-01-07
 
 ### Added
