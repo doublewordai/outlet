@@ -121,6 +121,9 @@ use body_wrapper::create_body_capture_stream;
 pub mod logging_handler;
 pub use logging_handler::LoggingHandler;
 
+pub mod multi_handler;
+pub use multi_handler::MultiHandler;
+
 /// Global atomic counter for correlation IDs and process start timestamp
 static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PROCESS_START_TIME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
