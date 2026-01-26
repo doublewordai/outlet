@@ -29,7 +29,11 @@ type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// This wraps RequestHandler implementations to allow storing them as trait objects.
 trait DynHandler: Send + Sync + 'static {
     fn handle_request_boxed(&self, data: RequestData) -> BoxFuture<'_>;
-    fn handle_response_boxed(&self, request_data: RequestData, response_data: ResponseData) -> BoxFuture<'_>;
+    fn handle_response_boxed(
+        &self,
+        request_data: RequestData,
+        response_data: ResponseData,
+    ) -> BoxFuture<'_>;
 }
 
 /// Wrapper that implements DynHandler for any RequestHandler.
@@ -42,7 +46,11 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         Box::pin(self.inner.handle_request(data))
     }
 
-    fn handle_response_boxed(&self, request_data: RequestData, response_data: ResponseData) -> BoxFuture<'_> {
+    fn handle_response_boxed(
+        &self,
+        request_data: RequestData,
+        response_data: ResponseData,
+    ) -> BoxFuture<'_> {
         Box::pin(self.inner.handle_response(request_data, response_data))
     }
 }
@@ -79,7 +87,8 @@ impl MultiHandler {
     ///     .with(LoggingHandler);
     /// ```
     pub fn with<H: RequestHandler>(mut self, handler: H) -> Self {
-        self.handlers.push(Arc::new(HandlerWrapper { inner: handler }));
+        self.handlers
+            .push(Arc::new(HandlerWrapper { inner: handler }));
         self
     }
 
