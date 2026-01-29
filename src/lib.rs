@@ -107,9 +107,23 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tokio::{sync::mpsc, task::JoinSet};
 use tower::{Layer, Service};
 use tracing::{debug, error, instrument, trace};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+/// Create a SpanContext from a trace_id string for adding span links.
+fn span_context_from_trace_id(trace_id: &str) -> Option<SpanContext> {
+    let trace_id = TraceId::from_hex(trace_id).ok()?;
+    Some(SpanContext::new(
+        trace_id,
+        SpanId::INVALID,
+        TraceFlags::SAMPLED,
+        false,
+        TraceState::default(),
+    ))
+}
 
 pub mod types;
 use types::BackgroundTask;
@@ -384,13 +398,28 @@ impl RequestLoggerLayer {
                                 let handler = handler_clone.clone();
                                 join_set.spawn(async move {
                                     match task {
-                                        BackgroundTask::Request(data) => {
+                                        BackgroundTask::Request { data, trace_id } => {
+                                            let span = tracing::info_span!("handle_request");
+                                            if let Some(ref trace_id) = trace_id {
+                                                if let Some(ctx) = span_context_from_trace_id(trace_id) {
+                                                    span.add_link(ctx);
+                                                }
+                                            }
+                                            let _guard = span.enter();
                                             handler.handle_request(data).await;
                                         }
                                         BackgroundTask::Response {
                                             request_data,
                                             response_data,
+                                            trace_id,
                                         } => {
+                                            let span = tracing::info_span!("handle_response");
+                                            if let Some(ref trace_id) = trace_id {
+                                                if let Some(ctx) = span_context_from_trace_id(trace_id) {
+                                                    span.add_link(ctx);
+                                                }
+                                            }
+                                            let _guard = span.enter();
                                             handler
                                                 .handle_response(request_data, response_data)
                                                 .await;
@@ -487,6 +516,19 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
+        // Capture trace_id from current span for linking background work to original request
+        let trace_id = {
+            let ctx = tracing::Span::current().context();
+            let span_ref = ctx.span();
+            let span_ctx = span_ref.span_context();
+            if span_ctx.is_valid() {
+                Some(span_ctx.trace_id().to_string())
+            } else {
+                None
+            }
+        };
+        let trace_id_for_response = trace_id.clone();
+
         trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
         // Setup request body capture
@@ -523,7 +565,10 @@ where
                 body,
             };
 
-            if let Err(e) = tx_for_request.send(BackgroundTask::Request(request_data.clone())) {
+            if let Err(e) = tx_for_request.send(BackgroundTask::Request {
+                data: request_data.clone(),
+                trace_id,
+            }) {
                 error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
@@ -608,6 +653,7 @@ where
                             .send(BackgroundTask::Response {
                                 request_data,
                                 response_data,
+                                trace_id: trace_id_for_response,
                             })
                             .is_err()
                         {
