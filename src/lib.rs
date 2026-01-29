@@ -110,7 +110,7 @@ use std::{
 use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tokio::{sync::mpsc, task::JoinSet};
 use tower::{Layer, Service};
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Create a SpanContext from a trace_id string for adding span links.
@@ -487,7 +487,6 @@ where
         self.inner.poll_ready(cx)
     }
 
-    #[instrument(skip_all)]
     fn call(&mut self, mut request: Request) -> Self::Future {
         // Check filter FIRST - if filtered, pass through immediately with zero overhead
         if let Some(ref filter) = self.config.path_filter {
@@ -505,6 +504,14 @@ where
         // Extract request metadata
         let method = request.method().clone();
         let uri = request.uri().clone();
+
+        // Create span with OTel HTTP semantic conventions
+        let span = tracing::info_span!(
+            "call",
+            http.request.method = %method,
+            url.path = %uri.path(),
+            url.query = uri.query().unwrap_or(""),
+        );
         let headers = request.headers().clone();
 
         let config = self.config.clone();
@@ -667,6 +674,6 @@ where
                 }
                 Err(e) => Err(e),
             }
-        })
+        }.instrument(span))
     }
 }
