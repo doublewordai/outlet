@@ -97,6 +97,7 @@
 
 use axum::{body::Body, extract::Request, response::Response};
 use metrics::counter;
+use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use std::{
     collections::HashMap,
     pin::Pin,
@@ -107,7 +108,6 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
 use tokio::{sync::mpsc, task::JoinSet};
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
