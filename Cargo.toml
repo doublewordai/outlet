@@ -1,6 +1,6 @@
 [package]
 name = "outlet"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "HTTP request/response logging middleware for Axum with streaming support"
 license = "MIT"
