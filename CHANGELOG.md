@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/doublewordai/outlet/compare/v0.4.5...v0.5.0) - 2026-02-02
+
+### Other
+
+- Revert "Revert "allow trace_ids to be picked up for joint up tracing ([#38](https://github.com/doublewordai/outlet/pull/38))" (…" ([#43](https://github.com/doublewordai/outlet/pull/43))
+
 ## [0.4.5](https://github.com/doublewordai/outlet/compare/v0.4.4...v0.4.5) - 2026-01-26
 
 ### Other
