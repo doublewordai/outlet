@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/doublewordai/outlet/compare/v0.5.0...v0.5.1) - 2026-02-02
+
+### Other
+
+- update otel version ([#48](https://github.com/doublewordai/outlet/pull/48))
+- enforce conventional commits in pr titles ([#46](https://github.com/doublewordai/outlet/pull/46))
+
 ## [0.5.0](https://github.com/doublewordai/outlet/compare/v0.4.5...v0.5.0) - 2026-02-02
 
 ### Added
