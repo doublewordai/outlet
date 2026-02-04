@@ -405,8 +405,7 @@ impl RequestLoggerLayer {
                                                     span.add_link(ctx);
                                                 }
                                             }
-                                            let _guard = span.enter();
-                                            handler.handle_request(data).await;
+                                            handler.handle_request(data).instrument(span).await;
                                         }
                                         BackgroundTask::Response {
                                             request_data,
@@ -419,9 +418,9 @@ impl RequestLoggerLayer {
                                                     span.add_link(ctx);
                                                 }
                                             }
-                                            let _guard = span.enter();
                                             handler
                                                 .handle_response(request_data, response_data)
+                                                .instrument(span)
                                                 .await;
                                         }
                                     }
