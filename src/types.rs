@@ -83,9 +83,7 @@ pub struct ResponseData {
 #[derive(Debug)]
 pub enum BackgroundTask {
     /// A request has been captured and is ready for processing
-    Request {
-        data: RequestData,
-    },
+    Request { data: RequestData },
     /// A response has been captured and is ready for processing.
     /// Contains both the request and response data to provide full context.
     Response {
