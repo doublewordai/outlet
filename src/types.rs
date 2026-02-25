@@ -81,7 +81,7 @@ pub struct ResponseData {
 ///
 /// Users typically don't interact with this type directly.
 #[derive(Debug)]
-pub enum BackgroundTask {
+pub(crate) enum BackgroundTask {
     /// A request has been captured and is ready for processing
     Request { data: RequestData },
     /// A response has been captured and is ready for processing.
