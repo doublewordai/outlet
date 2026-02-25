@@ -398,14 +398,8 @@ impl RequestLoggerLayer {
                                 let handler = handler_clone.clone();
                                 join_set.spawn(async move {
                                     match task {
-                                        BackgroundTask::Request { data, trace_id } => {
-                                            let span = tracing::info_span!("handle_request");
-                                            if let Some(ref trace_id) = trace_id {
-                                                if let Some(ctx) = span_context_from_trace_id(trace_id) {
-                                                    span.add_link(ctx);
-                                                }
-                                            }
-                                            handler.handle_request(data).instrument(span).await;
+                                        BackgroundTask::Request { data, .. } => {
+                                            handler.handle_request(data).await;
                                         }
                                         BackgroundTask::Response {
                                             request_data,
@@ -414,8 +408,10 @@ impl RequestLoggerLayer {
                                         } => {
                                             let span = tracing::info_span!("handle_response");
                                             if let Some(ref trace_id) = trace_id {
-                                                if let Some(ctx) = span_context_from_trace_id(trace_id) {
-                                                    span.add_link(ctx);
+                                                if let Some(sc) = span_context_from_trace_id(trace_id) {
+                                                    let parent_ctx = opentelemetry::Context::new()
+                                                        .with_remote_span_context(sc);
+                                                    let _ = span.set_parent(parent_ctx);
                                                 }
                                             }
                                             handler
@@ -523,7 +519,7 @@ where
         let tx_for_response = tx.clone();
 
         // Capture trace_id from current span for linking background work to original request
-        let trace_id = {
+        let trace_id_for_response = {
             let ctx = tracing::Span::current().context();
             let span_ref = ctx.span();
             let span_ctx = span_ref.span_context();
@@ -533,7 +529,6 @@ where
                 None
             }
         };
-        let trace_id_for_response = trace_id.clone();
 
         trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
@@ -573,7 +568,6 @@ where
 
             if let Err(e) = tx_for_request.send(BackgroundTask::Request {
                 data: request_data.clone(),
-                trace_id,
             }) {
                 error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
