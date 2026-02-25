@@ -85,8 +85,6 @@ pub enum BackgroundTask {
     /// A request has been captured and is ready for processing
     Request {
         data: RequestData,
-        /// OpenTelemetry trace ID from the original request, for creating span links
-        trace_id: Option<String>,
     },
     /// A response has been captured and is ready for processing.
     /// Contains both the request and response data to provide full context.
