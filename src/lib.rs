@@ -113,14 +113,19 @@ use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Create a SpanContext from a trace_id string for adding span links.
-fn span_context_from_trace_id(trace_id: &str) -> Option<SpanContext> {
+/// Create a SpanContext from a trace_id and optional span_id for placing spans in the same trace.
+/// When span_id is provided, the resulting span becomes a child of that specific span.
+/// When span_id is None, a placeholder is used and the span appears at the trace root.
+fn span_context_from_ids(trace_id: &str, span_id: Option<&str>) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = span_id
+        .and_then(|s| SpanId::from_hex(s).ok())
+        .unwrap_or(SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 1]));
     Some(SpanContext::new(
         trace_id,
-        SpanId::INVALID,
+        span_id,
         TraceFlags::SAMPLED,
-        false,
+        true, // is_remote
         TraceState::default(),
     ))
 }
@@ -405,10 +410,11 @@ impl RequestLoggerLayer {
                                             request_data,
                                             response_data,
                                             trace_id,
+                                            span_id,
                                         } => {
-                                            let span = tracing::info_span!("handle_response");
+                                            let span = tracing::info_span!("outlet.handle_response");
                                             if let Some(ref trace_id) = trace_id {
-                                                if let Some(sc) = span_context_from_trace_id(trace_id) {
+                                                if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref()) {
                                                     let parent_ctx = opentelemetry::Context::new()
                                                         .with_remote_span_context(sc);
                                                     let _ = span.set_parent(parent_ctx);
@@ -502,7 +508,7 @@ where
 
         // Create span with OTel HTTP semantic conventions
         let span = tracing::info_span!(
-            "call",
+            "outlet.call",
             http.request.method = %method,
             url.path = %uri.path(),
             url.query = uri.query().unwrap_or(""),
@@ -518,15 +524,18 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
-        // Capture trace_id from current span for linking background work to original request
-        let trace_id_for_response = {
+        // Capture trace_id and span_id from current span for parenting background work
+        let (trace_id_for_response, span_id_for_response) = {
             let ctx = tracing::Span::current().context();
             let span_ref = ctx.span();
             let span_ctx = span_ref.span_context();
             if span_ctx.is_valid() {
-                Some(span_ctx.trace_id().to_string())
+                (
+                    Some(span_ctx.trace_id().to_string()),
+                    Some(span_ctx.span_id().to_string()),
+                )
             } else {
-                None
+                (None, None)
             }
         };
 
@@ -654,6 +663,7 @@ where
                                 request_data,
                                 response_data,
                                 trace_id: trace_id_for_response,
+                                span_id: span_id_for_response,
                             })
                             .is_err()
                         {
