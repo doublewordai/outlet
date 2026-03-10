@@ -374,7 +374,6 @@ impl RequestLoggerLayer {
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<BackgroundTask>();
         let handler = Arc::new(handler);
-        let handler_clone = handler.clone();
 
         // Spawn the background task with concurrent handler execution via JoinSet
         // Unlike FuturesUnordered, JoinSet spawns tasks onto the executor independently,
@@ -395,7 +394,7 @@ impl RequestLoggerLayer {
                         match task {
                             Some(task) => {
                                 counter!("outlet_queue_dequeued_total").increment(1);
-                                let handler = handler_clone.clone();
+                                let handler = handler.clone();
                                 join_set.spawn(async move {
                                     match task {
                                         BackgroundTask::Request { data, .. } => {
@@ -514,9 +513,9 @@ where
 
         let method_clone = method.clone();
         let uri_clone = uri.clone();
-        let headers_clone = headers.clone();
+        let request_headers = headers;
         let tx_for_request = tx.clone();
-        let tx_for_response = tx.clone();
+        let tx_for_response = tx;
 
         // Capture trace_id from current span for linking background work to original request
         let trace_id_for_response = {
@@ -562,7 +561,7 @@ where
                 timestamp: start_time,
                 method: method_clone,
                 uri: uri_clone,
-                headers: convert_headers(&headers_clone),
+                headers: convert_headers(&request_headers),
                 body,
             };
 
