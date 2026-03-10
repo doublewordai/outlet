@@ -4,6 +4,7 @@
 //! while allowing them to continue streaming to their destination.
 
 use axum::body::Bytes;
+use bytes::BytesMut;
 use futures::{Future, StreamExt};
 use http_body_util::BodyExt;
 use std::pin::Pin;
@@ -82,10 +83,12 @@ where
                 Err(e) => return Err(e),
             }
         }
-        Ok(chunks.into_iter().fold(Bytes::new(), |mut acc, chunk| {
-            acc = [acc.as_ref(), chunk.as_ref()].concat().into();
-            acc
-        }))
+        let total_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+        let mut buf = BytesMut::with_capacity(total_len);
+        for chunk in chunks {
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf.freeze())
     });
 
     (new_body, capture_future)
