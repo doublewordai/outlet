@@ -89,7 +89,11 @@ pub(crate) enum BackgroundTask {
     Response {
         request_data: RequestData,
         response_data: ResponseData,
-        /// OpenTelemetry trace ID from the original request, for creating span links
+        /// OpenTelemetry trace ID from the original request, for placing in the same trace
         trace_id: Option<String>,
+        /// OpenTelemetry span ID from the original request, for parenting under the correct span
+        span_id: Option<String>,
+        /// OpenTelemetry trace flags from the original request, to preserve sampling decisions
+        trace_flags: u8,
     },
 }

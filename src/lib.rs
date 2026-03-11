@@ -113,14 +113,20 @@ use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Create a SpanContext from a trace_id string for adding span links.
-fn span_context_from_trace_id(trace_id: &str) -> Option<SpanContext> {
+/// Create a SpanContext from a trace_id and span_id for parenting spans in the same trace.
+/// Returns None if either ID is missing or invalid — callers should skip set_parent in that case.
+fn span_context_from_ids(
+    trace_id: &str,
+    span_id: Option<&str>,
+    trace_flags: u8,
+) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_id).ok()?;
+    let span_id = SpanId::from_hex(span_id?).ok()?;
     Some(SpanContext::new(
         trace_id,
-        SpanId::INVALID,
-        TraceFlags::SAMPLED,
-        false,
+        span_id,
+        TraceFlags::new(trace_flags),
+        true, // is_remote
         TraceState::default(),
     ))
 }
@@ -405,13 +411,17 @@ impl RequestLoggerLayer {
                                             request_data,
                                             response_data,
                                             trace_id,
+                                            span_id,
+                                            trace_flags,
                                         } => {
-                                            let span = tracing::info_span!("handle_response");
+                                            let span = tracing::info_span!("outlet.handle_response");
+                                            // Link (not parent) to the original request span.
+                                            // This is background work that runs after the response
+                                            // completes, so a parent-child relationship would
+                                            // misleadingly inflate the request span's duration.
                                             if let Some(ref trace_id) = trace_id {
-                                                if let Some(sc) = span_context_from_trace_id(trace_id) {
-                                                    let parent_ctx = opentelemetry::Context::new()
-                                                        .with_remote_span_context(sc);
-                                                    let _ = span.set_parent(parent_ctx);
+                                                if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref(), trace_flags) {
+                                                    span.add_link(sc);
                                                 }
                                             }
                                             handler
@@ -502,7 +512,7 @@ where
 
         // Create span with OTel HTTP semantic conventions
         let span = tracing::info_span!(
-            "call",
+            "outlet.call",
             http.request.method = %method,
             url.path = %uri.path(),
             url.query = uri.query().unwrap_or(""),
@@ -518,15 +528,19 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
-        // Capture trace_id from current span for linking background work to original request
-        let trace_id_for_response = {
+        // Capture trace_id, span_id, and trace_flags from current span for parenting background work
+        let (trace_id_for_response, span_id_for_response, trace_flags_for_response) = {
             let ctx = tracing::Span::current().context();
             let span_ref = ctx.span();
             let span_ctx = span_ref.span_context();
             if span_ctx.is_valid() {
-                Some(span_ctx.trace_id().to_string())
+                (
+                    Some(span_ctx.trace_id().to_string()),
+                    Some(span_ctx.span_id().to_string()),
+                    span_ctx.trace_flags().to_u8(),
+                )
             } else {
-                None
+                (None, None, TraceFlags::default().to_u8())
             }
         };
 
@@ -654,6 +668,8 @@ where
                                 request_data,
                                 response_data,
                                 trace_id: trace_id_for_response,
+                                span_id: span_id_for_response,
+                                trace_flags: trace_flags_for_response,
                             })
                             .is_err()
                         {
