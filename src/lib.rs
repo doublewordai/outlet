@@ -115,7 +115,11 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Create a SpanContext from a trace_id and span_id for parenting spans in the same trace.
 /// Returns None if either ID is missing or invalid — callers should skip set_parent in that case.
-fn span_context_from_ids(trace_id: &str, span_id: Option<&str>, trace_flags: u8) -> Option<SpanContext> {
+fn span_context_from_ids(
+    trace_id: &str,
+    span_id: Option<&str>,
+    trace_flags: u8,
+) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_id).ok()?;
     let span_id = SpanId::from_hex(span_id?).ok()?;
     Some(SpanContext::new(
