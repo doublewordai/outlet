@@ -37,6 +37,12 @@ pub struct RequestData {
     pub headers: HashMap<String, Vec<Bytes>>,
     /// Request body bytes, if body capture is enabled and the body was successfully captured
     pub body: Option<Bytes>,
+    /// OpenTelemetry trace ID from the span context when this request was captured.
+    /// 32-character lowercase hex string (128-bit trace ID).
+    pub trace_id: Option<String>,
+    /// OpenTelemetry span ID from the span context when this request was captured.
+    /// 16-character lowercase hex string (64-bit span ID).
+    pub span_id: Option<String>,
 }
 
 /// Data captured from an HTTP response.

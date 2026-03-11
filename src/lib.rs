@@ -543,6 +543,9 @@ where
                 (None, None, TraceFlags::default().to_u8())
             }
         };
+        // Clone for RequestData (the originals are moved into the response closure later)
+        let trace_id_for_request = trace_id_for_response.clone();
+        let span_id_for_request = span_id_for_response.clone();
 
         trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
@@ -578,6 +581,8 @@ where
                 uri: uri_clone,
                 headers: convert_headers(&headers_clone),
                 body,
+                trace_id: trace_id_for_request,
+                span_id: span_id_for_request,
             };
 
             if let Err(e) = tx_for_request.send(BackgroundTask::Request {
