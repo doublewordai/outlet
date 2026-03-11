@@ -169,6 +169,8 @@ mod tests {
             uri: Uri::from_static("/test"),
             headers: std::collections::HashMap::new(),
             body: None,
+            trace_id: None,
+            span_id: None,
         }
     }
 
