@@ -411,11 +411,13 @@ impl RequestLoggerLayer {
                                             trace_flags,
                                         } => {
                                             let span = tracing::info_span!("outlet.handle_response");
+                                            // Link (not parent) to the original request span.
+                                            // This is background work that runs after the response
+                                            // completes, so a parent-child relationship would
+                                            // misleadingly inflate the request span's duration.
                                             if let Some(ref trace_id) = trace_id {
                                                 if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref(), trace_flags) {
-                                                    let parent_ctx = opentelemetry::Context::new()
-                                                        .with_remote_span_context(sc);
-                                                    let _ = span.set_parent(parent_ctx);
+                                                    span.add_link(sc);
                                                 }
                                             }
                                             handler
