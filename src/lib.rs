@@ -113,14 +113,11 @@ use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-/// Create a SpanContext from a trace_id and optional span_id for placing spans in the same trace.
-/// When span_id is provided, the resulting span becomes a child of that specific span.
-/// When span_id is None, a placeholder is used and the span appears at the trace root.
+/// Create a SpanContext from a trace_id and span_id for parenting spans in the same trace.
+/// Returns None if either ID is missing or invalid — callers should skip set_parent in that case.
 fn span_context_from_ids(trace_id: &str, span_id: Option<&str>) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_id).ok()?;
-    let span_id = span_id
-        .and_then(|s| SpanId::from_hex(s).ok())
-        .unwrap_or(SpanId::from_bytes([0, 0, 0, 0, 0, 0, 0, 1]));
+    let span_id = SpanId::from_hex(span_id?).ok()?;
     Some(SpanContext::new(
         trace_id,
         span_id,
