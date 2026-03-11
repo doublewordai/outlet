@@ -115,13 +115,13 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Create a SpanContext from a trace_id and span_id for parenting spans in the same trace.
 /// Returns None if either ID is missing or invalid — callers should skip set_parent in that case.
-fn span_context_from_ids(trace_id: &str, span_id: Option<&str>) -> Option<SpanContext> {
+fn span_context_from_ids(trace_id: &str, span_id: Option<&str>, trace_flags: u8) -> Option<SpanContext> {
     let trace_id = TraceId::from_hex(trace_id).ok()?;
     let span_id = SpanId::from_hex(span_id?).ok()?;
     Some(SpanContext::new(
         trace_id,
         span_id,
-        TraceFlags::SAMPLED,
+        TraceFlags::new(trace_flags),
         true, // is_remote
         TraceState::default(),
     ))
@@ -408,10 +408,11 @@ impl RequestLoggerLayer {
                                             response_data,
                                             trace_id,
                                             span_id,
+                                            trace_flags,
                                         } => {
                                             let span = tracing::info_span!("outlet.handle_response");
                                             if let Some(ref trace_id) = trace_id {
-                                                if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref()) {
+                                                if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref(), trace_flags) {
                                                     let parent_ctx = opentelemetry::Context::new()
                                                         .with_remote_span_context(sc);
                                                     let _ = span.set_parent(parent_ctx);
@@ -521,8 +522,8 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
-        // Capture trace_id and span_id from current span for parenting background work
-        let (trace_id_for_response, span_id_for_response) = {
+        // Capture trace_id, span_id, and trace_flags from current span for parenting background work
+        let (trace_id_for_response, span_id_for_response, trace_flags_for_response) = {
             let ctx = tracing::Span::current().context();
             let span_ref = ctx.span();
             let span_ctx = span_ref.span_context();
@@ -530,9 +531,10 @@ where
                 (
                     Some(span_ctx.trace_id().to_string()),
                     Some(span_ctx.span_id().to_string()),
+                    span_ctx.trace_flags().to_u8(),
                 )
             } else {
-                (None, None)
+                (None, None, TraceFlags::default().to_u8())
             }
         };
 
@@ -661,6 +663,7 @@ where
                                 response_data,
                                 trace_id: trace_id_for_response,
                                 span_id: span_id_for_response,
+                                trace_flags: trace_flags_for_response,
                             })
                             .is_err()
                         {
