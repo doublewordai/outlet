@@ -34,6 +34,11 @@ trait DynHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> BoxFuture<'_>;
+    fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a>;
+    fn handle_response_batch_boxed<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> BoxFuture<'a>;
 }
 
 /// Wrapper that implements DynHandler for any RequestHandler.
@@ -52,6 +57,17 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         response_data: ResponseData,
     ) -> BoxFuture<'_> {
         Box::pin(self.inner.handle_response(request_data, response_data))
+    }
+
+    fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a> {
+        Box::pin(self.inner.handle_request_batch(batch))
+    }
+
+    fn handle_response_batch_boxed<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> BoxFuture<'a> {
+        Box::pin(self.inner.handle_response_batch(batch))
     }
 }
 
@@ -133,6 +149,24 @@ impl RequestHandler for MultiHandler {
                 let handler = h.clone();
                 async move { handler.handle_response_boxed(req, res).await }
             })
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_request_batch(&self, batch: &[RequestData]) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.handle_request_batch_boxed(batch))
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_response_batch(&self, batch: &[(RequestData, ResponseData)]) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.handle_response_batch_boxed(batch))
             .collect();
         futures::future::join_all(futures).await;
     }
@@ -307,6 +341,93 @@ mod tests {
             self.barrier.wait().await;
             self.completed.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn test_multi_handler_request_batch() {
+        let request_count1 = Arc::new(AtomicUsize::new(0));
+        let request_count2 = Arc::new(AtomicUsize::new(0));
+
+        let handler = MultiHandler::new()
+            .with(CountingHandler {
+                request_count: request_count1.clone(),
+                response_count: Arc::new(AtomicUsize::new(0)),
+            })
+            .with(CountingHandler {
+                request_count: request_count2.clone(),
+                response_count: Arc::new(AtomicUsize::new(0)),
+            });
+
+        let batch = vec![
+            create_test_request_data(),
+            create_test_request_data(),
+            create_test_request_data(),
+        ];
+
+        handler.handle_request_batch(&batch).await;
+
+        // Each handler should process all 3 items via default batch impl
+        assert_eq!(request_count1.load(Ordering::SeqCst), 3);
+        assert_eq!(request_count2.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_multi_handler_response_batch() {
+        let response_count1 = Arc::new(AtomicUsize::new(0));
+        let response_count2 = Arc::new(AtomicUsize::new(0));
+
+        let handler = MultiHandler::new()
+            .with(CountingHandler {
+                request_count: Arc::new(AtomicUsize::new(0)),
+                response_count: response_count1.clone(),
+            })
+            .with(CountingHandler {
+                request_count: Arc::new(AtomicUsize::new(0)),
+                response_count: response_count2.clone(),
+            });
+
+        let batch = vec![
+            (create_test_request_data(), create_test_response_data()),
+            (create_test_request_data(), create_test_response_data()),
+        ];
+
+        handler.handle_response_batch(&batch).await;
+
+        // Each handler should process all 2 items via default batch impl
+        assert_eq!(response_count1.load(Ordering::SeqCst), 2);
+        assert_eq!(response_count2.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_handler_batch_runs_concurrently() {
+        // Barrier requires 2 waiters — proves both handlers run concurrently
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let handler = MultiHandler::new()
+            .with(BarrierHandler {
+                barrier: barrier.clone(),
+                completed: completed.clone(),
+            })
+            .with(BarrierHandler {
+                barrier: barrier.clone(),
+                completed: completed.clone(),
+            });
+
+        // Single-item batch: each handler gets 1 item, both must reach barrier
+        let batch = vec![create_test_request_data()];
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            handler.handle_request_batch(&batch),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Batch handlers must run concurrently across handlers — barrier would deadlock if sequential"
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

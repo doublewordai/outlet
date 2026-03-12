@@ -97,7 +97,7 @@
 
 use axum::{body::Body, extract::Request, response::Response};
 use metrics::counter;
-use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState};
+use opentelemetry::trace::TraceContextExt;
 use std::{
     collections::HashMap,
     pin::Pin,
@@ -108,28 +108,10 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::sync::mpsc;
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-/// Create a SpanContext from a trace_id and span_id for parenting spans in the same trace.
-/// Returns None if either ID is missing or invalid — callers should skip set_parent in that case.
-fn span_context_from_ids(
-    trace_id: &str,
-    span_id: Option<&str>,
-    trace_flags: u8,
-) -> Option<SpanContext> {
-    let trace_id = TraceId::from_hex(trace_id).ok()?;
-    let span_id = SpanId::from_hex(span_id?).ok()?;
-    Some(SpanContext::new(
-        trace_id,
-        span_id,
-        TraceFlags::new(trace_flags),
-        true, // is_remote
-        TraceState::default(),
-    ))
-}
 
 pub mod types;
 use types::BackgroundTask;
@@ -195,6 +177,7 @@ fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes
 ///     capture_request_body: true,
 ///     capture_response_body: false,
 ///     path_filter: None,
+///     ..Default::default()
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -205,6 +188,11 @@ pub struct RequestLoggerConfig {
     pub capture_response_body: bool,
     /// Optional path filter to skip body capture for requests that don't match
     pub path_filter: Option<PathFilter>,
+    /// Capacity of the bounded channel between the middleware and the background
+    /// processing task. When the channel is full, new items are dropped (with a
+    /// counter increment on `outlet_queue_dropped_total`) rather than applying
+    /// backpressure to the request path. Default: 4096.
+    pub channel_capacity: usize,
 }
 
 /// Filter configuration for determining which requests to capture.
@@ -227,6 +215,7 @@ impl Default for RequestLoggerConfig {
             capture_request_body: true,
             capture_response_body: true,
             path_filter: None,
+            channel_capacity: 4096,
         }
     }
 }
@@ -307,6 +296,48 @@ pub trait RequestHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Handle a batch of captured HTTP requests.
+    ///
+    /// Called by the background task with all requests that have accumulated since
+    /// the last flush. The default implementation clones each item and calls
+    /// [`handle_request`] concurrently via `join_all`.
+    ///
+    /// Override this method to perform bulk operations (e.g. batch INSERT)
+    /// that can borrow directly from the slice without cloning.
+    fn handle_request_batch(
+        &self,
+        batch: &[RequestData],
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let futures: Vec<_> = batch
+                .iter()
+                .map(|data| self.handle_request(data.clone()))
+                .collect();
+            futures::future::join_all(futures).await;
+        }
+    }
+
+    /// Handle a batch of captured HTTP responses.
+    ///
+    /// Called by the background task with all responses that have accumulated since
+    /// the last flush. The default implementation clones each item and calls
+    /// [`handle_response`] concurrently via `join_all`.
+    ///
+    /// Override this method to perform bulk operations (e.g. batch INSERT)
+    /// that can borrow directly from the slice without cloning.
+    fn handle_response_batch(
+        &self,
+        batch: &[(RequestData, ResponseData)],
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let futures: Vec<_> = batch
+                .iter()
+                .map(|(req, res)| self.handle_response(req.clone(), res.clone()))
+                .collect();
+            futures::future::join_all(futures).await;
+        }
+    }
 }
 
 /// Tower layer for the request logging middleware.
@@ -342,7 +373,7 @@ pub trait RequestHandler: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct RequestLoggerLayer {
     config: RequestLoggerConfig,
-    tx: mpsc::UnboundedSender<BackgroundTask>,
+    tx: mpsc::Sender<BackgroundTask>,
 }
 
 impl RequestLoggerLayer {
@@ -367,6 +398,7 @@ impl RequestLoggerLayer {
     ///     capture_request_body: true,
     ///     capture_response_body: true,
     ///     path_filter: None,
+    ///     ..Default::default()
     /// };
     /// let handler = LoggingHandler;
     ///
@@ -378,70 +410,83 @@ impl RequestLoggerLayer {
     /// # }
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<BackgroundTask>();
+        let (tx, mut rx) = mpsc::channel::<BackgroundTask>(config.channel_capacity);
         let handler = Arc::new(handler);
         let handler_clone = handler.clone();
 
-        // Spawn the background task with concurrent handler execution via JoinSet
-        // Unlike FuturesUnordered, JoinSet spawns tasks onto the executor independently,
-        // avoiding implicit sequencing that could cause deadlocks with shared resources.
+        // Spawn the background task using write-through batching.
+        // Waits for at least one item, drains all available items, then flushes
+        // the batch to the handler. This gives low latency at low load (single
+        // item → immediate flush) and batching efficiency at high load.
         tokio::spawn(async move {
-            let mut join_set = JoinSet::new();
-
             loop {
-                tokio::select! {
-                    // Reap completed tasks to prevent unbounded growth
-                    Some(result) = join_set.join_next(), if !join_set.is_empty() => {
-                        if let Err(e) = result {
-                            error!("Handler task panicked: {}", e);
+                // Block until at least one item arrives (or channel closes)
+                let first = match rx.recv().await {
+                    Some(task) => task,
+                    None => break, // channel closed, shut down
+                };
+
+                // Non-blocking drain of all queued items
+                let mut tasks = vec![first];
+                while let Ok(task) = rx.try_recv() {
+                    tasks.push(task);
+                }
+
+                counter!("outlet_queue_dequeued_total").increment(tasks.len() as u64);
+
+                // Separate into request and response batches
+                let mut request_batch = Vec::new();
+                let mut response_batch = Vec::new();
+
+                for task in tasks {
+                    match task {
+                        BackgroundTask::Request { data } => {
+                            request_batch.push(data);
+                        }
+                        BackgroundTask::Response {
+                            request_data,
+                            response_data,
+                            ..
+                        } => {
+                            response_batch.push((request_data, response_data));
                         }
                     }
-                    // Accept new tasks from the channel
-                    task = rx.recv() => {
-                        match task {
-                            Some(task) => {
-                                counter!("outlet_queue_dequeued_total").increment(1);
-                                let handler = handler_clone.clone();
-                                join_set.spawn(async move {
-                                    match task {
-                                        BackgroundTask::Request { data, .. } => {
-                                            handler.handle_request(data).await;
-                                        }
-                                        BackgroundTask::Response {
-                                            request_data,
-                                            response_data,
-                                            trace_id,
-                                            span_id,
-                                            trace_flags,
-                                        } => {
-                                            let span = tracing::info_span!("outlet.handle_response");
-                                            // Link (not parent) to the original request span.
-                                            // This is background work that runs after the response
-                                            // completes, so a parent-child relationship would
-                                            // misleadingly inflate the request span's duration.
-                                            if let Some(ref trace_id) = trace_id {
-                                                if let Some(sc) = span_context_from_ids(trace_id, span_id.as_deref(), trace_flags) {
-                                                    span.add_link(sc);
-                                                }
-                                            }
-                                            handler
-                                                .handle_response(request_data, response_data)
-                                                .instrument(span)
-                                                .await;
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                // Channel closed, wait for remaining handlers to complete
-                                while let Some(result) = join_set.join_next().await {
-                                    if let Err(e) = result {
-                                        error!("Handler task panicked: {}", e);
-                                    }
-                                }
-                                break;
-                            }
-                        }
+                }
+
+                // Dispatch request and response batches concurrently.
+                // Each batch is spawned as a task so a panic in one handler
+                // doesn't kill the background loop.
+                let handler = handler_clone.clone();
+                let req_handle = if !request_batch.is_empty() {
+                    let h = handler.clone();
+                    Some(tokio::spawn(async move {
+                        h.handle_request_batch(&request_batch).await;
+                    }))
+                } else {
+                    None
+                };
+                let res_handle = if !response_batch.is_empty() {
+                    let h = handler.clone();
+                    Some(tokio::spawn(async move {
+                        let span = tracing::info_span!(
+                            "outlet.handle_response_batch",
+                            batch_size = response_batch.len(),
+                        );
+                        h.handle_response_batch(&response_batch)
+                            .instrument(span)
+                            .await;
+                    }))
+                } else {
+                    None
+                };
+                if let Some(handle) = req_handle {
+                    if let Err(e) = handle.await {
+                        error!("Request batch handler panicked: {}", e);
+                    }
+                }
+                if let Some(handle) = res_handle {
+                    if let Err(e) = handle.await {
+                        error!("Response batch handler panicked: {}", e);
                     }
                 }
             }
@@ -474,7 +519,7 @@ impl<S> Layer<S> for RequestLoggerLayer {
 pub struct RequestLoggerService<S> {
     inner: S,
     config: RequestLoggerConfig,
-    tx: mpsc::UnboundedSender<BackgroundTask>,
+    tx: mpsc::Sender<BackgroundTask>,
 }
 
 impl<S> Service<Request> for RequestLoggerService<S>
@@ -528,8 +573,8 @@ where
         let tx_for_request = tx.clone();
         let tx_for_response = tx.clone();
 
-        // Capture trace_id, span_id, and trace_flags from current span for parenting background work
-        let (trace_id_for_response, span_id_for_response, trace_flags_for_response) = {
+        // Capture trace_id and span_id from current span for RequestData
+        let (trace_id, span_id) = {
             let ctx = tracing::Span::current().context();
             let span_ref = ctx.span();
             let span_ctx = span_ref.span_context();
@@ -537,15 +582,11 @@ where
                 (
                     Some(span_ctx.trace_id().to_string()),
                     Some(span_ctx.span_id().to_string()),
-                    span_ctx.trace_flags().to_u8(),
                 )
             } else {
-                (None, None, TraceFlags::default().to_u8())
+                (None, None)
             }
         };
-        // Clone for RequestData (the originals are moved into the response closure later)
-        let trace_id_for_request = trace_id_for_response.clone();
-        let span_id_for_request = span_id_for_response.clone();
 
         trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
@@ -581,14 +622,15 @@ where
                 uri: uri_clone,
                 headers: convert_headers(&headers_clone),
                 body,
-                trace_id: trace_id_for_request,
-                span_id: span_id_for_request,
+                trace_id: trace_id.clone(),
+                span_id: span_id.clone(),
             };
 
-            if let Err(e) = tx_for_request.send(BackgroundTask::Request {
+            if let Err(e) = tx_for_request.try_send(BackgroundTask::Request {
                 data: request_data.clone(),
             }) {
-                error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
+                counter!("outlet_queue_dropped_total").increment(1);
+                error!(correlation_id = %correlation_id, error = %e, "Dropped request data: channel full or closed");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
             counter!("outlet_queue_enqueued_total").increment(1);
@@ -669,16 +711,14 @@ where
                         };
 
                         if tx_for_response
-                            .send(BackgroundTask::Response {
+                            .try_send(BackgroundTask::Response {
                                 request_data,
                                 response_data,
-                                trace_id: trace_id_for_response,
-                                span_id: span_id_for_response,
-                                trace_flags: trace_flags_for_response,
                             })
                             .is_err()
                         {
-                            error!(correlation_id = %correlation_id, "Failed to send response data to background task");
+                            counter!("outlet_queue_dropped_total").increment(1);
+                            error!(correlation_id = %correlation_id, "Dropped response data: channel full or closed");
                         } else {
                             counter!("outlet_queue_enqueued_total").increment(1);
                         }

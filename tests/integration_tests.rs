@@ -9,7 +9,10 @@ use bytes::Bytes;
 use futures::stream;
 use outlet::{types::*, RequestHandler, RequestLoggerConfig, RequestLoggerLayer};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::time::sleep;
@@ -136,6 +139,7 @@ async fn test_basic_request_response() {
         capture_request_body: false,
         capture_response_body: false,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -165,6 +169,7 @@ async fn test_request_with_body_capture() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -207,6 +212,7 @@ async fn test_streaming_response_capture() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -240,6 +246,7 @@ async fn test_large_body_size_limit() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -273,6 +280,7 @@ async fn test_multiple_concurrent_requests() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = std::sync::Arc::new(axum_test::TestServer::new(app).unwrap());
@@ -328,6 +336,7 @@ async fn test_timing_accuracy() {
         capture_request_body: false,
         capture_response_body: false,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -362,6 +371,7 @@ async fn test_empty_body_handling() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -396,6 +406,7 @@ async fn test_correlation_isolation() {
         capture_request_body: true,
         capture_response_body: true,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -453,6 +464,7 @@ async fn test_config_disable_capture() {
         capture_request_body: false,
         capture_response_body: false,
         path_filter: None,
+        ..Default::default()
     };
     let app = create_test_app(handler.clone(), config);
     let server = axum_test::TestServer::new(app).unwrap();
@@ -506,4 +518,146 @@ async fn test_middleware_passthrough() {
     // Verify all were captured
     let pairs = handler.get_completed_pairs();
     assert_eq!(pairs.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for standalone tests (not using the middleware)
+// ---------------------------------------------------------------------------
+
+fn make_request_data() -> RequestData {
+    RequestData {
+        correlation_id: 0,
+        timestamp: SystemTime::now(),
+        method: Method::GET,
+        uri: "/test".parse().unwrap(),
+        headers: HashMap::new(),
+        body: None,
+        trace_id: None,
+        span_id: None,
+    }
+}
+
+fn make_response_data() -> ResponseData {
+    ResponseData {
+        correlation_id: 0,
+        timestamp: SystemTime::now(),
+        status: StatusCode::OK,
+        headers: HashMap::new(),
+        body: None,
+        duration_to_first_byte: Duration::from_millis(1),
+        duration: Duration::from_millis(10),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default batch implementation tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_default_batch_impl_calls_individual_methods() {
+    /// Handler that counts individual handle_request / handle_response calls
+    struct CountingHandler {
+        request_count: Arc<AtomicUsize>,
+        response_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for CountingHandler {
+        async fn handle_request(&self, _data: RequestData) {
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn handle_response(&self, _req: RequestData, _res: ResponseData) {
+            self.response_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let response_count = Arc::new(AtomicUsize::new(0));
+
+    let handler = CountingHandler {
+        request_count: request_count.clone(),
+        response_count: response_count.clone(),
+    };
+
+    // Default handle_request_batch should call handle_request for each item
+    let batch = vec![
+        make_request_data(),
+        make_request_data(),
+        make_request_data(),
+    ];
+    handler.handle_request_batch(&batch).await;
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
+
+    // Default handle_response_batch should call handle_response for each item
+    let batch = vec![
+        (make_request_data(), make_response_data()),
+        (make_request_data(), make_response_data()),
+    ];
+    handler.handle_response_batch(&batch).await;
+    assert_eq!(response_count.load(Ordering::SeqCst), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Panic safety tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_panic_in_handler_doesnt_kill_background_loop() {
+    /// Handler that panics on first response, succeeds on subsequent ones
+    struct PanickingHandler {
+        response_call_count: Arc<AtomicUsize>,
+        successful_responses: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl RequestHandler for PanickingHandler {
+        async fn handle_request(&self, _data: RequestData) {}
+        async fn handle_response(&self, request_data: RequestData, _response_data: ResponseData) {
+            let count = self.response_call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                panic!("intentional test panic");
+            }
+            self.successful_responses
+                .lock()
+                .unwrap()
+                .push(request_data.correlation_id);
+        }
+    }
+
+    let response_call_count = Arc::new(AtomicUsize::new(0));
+    let successful_responses = Arc::new(Mutex::new(Vec::new()));
+
+    let handler = PanickingHandler {
+        response_call_count: response_call_count.clone(),
+        successful_responses: successful_responses.clone(),
+    };
+
+    let config = RequestLoggerConfig {
+        capture_request_body: false,
+        capture_response_body: false,
+        path_filter: None,
+        ..Default::default()
+    };
+
+    let app = Router::new().route("/hello", get(hello_handler)).layer(
+        ServiceBuilder::new()
+            .layer(RequestLoggerLayer::new(config, handler))
+            .into_inner(),
+    );
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    // First request — response handler will panic in the spawned task
+    server.get("/hello").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Second request — background loop should still be alive
+    server.get("/hello").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        response_call_count.load(Ordering::SeqCst) >= 2,
+        "Response handler should have been called at least twice"
+    );
+    assert!(
+        !successful_responses.lock().unwrap().is_empty(),
+        "Background loop must survive a handler panic and process subsequent requests"
+    );
 }
