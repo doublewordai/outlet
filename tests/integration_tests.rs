@@ -584,7 +584,7 @@ async fn test_default_batch_impl_calls_individual_methods() {
         make_request_data(),
         make_request_data(),
     ];
-    handler.handle_request_batch(batch).await;
+    handler.handle_request_batch(&batch).await;
     assert_eq!(request_count.load(Ordering::SeqCst), 3);
 
     // Default handle_response_batch should call handle_response for each item
@@ -592,7 +592,7 @@ async fn test_default_batch_impl_calls_individual_methods() {
         (make_request_data(), make_response_data()),
         (make_request_data(), make_response_data()),
     ];
-    handler.handle_response_batch(batch).await;
+    handler.handle_response_batch(&batch).await;
     assert_eq!(response_count.load(Ordering::SeqCst), 2);
 }
 

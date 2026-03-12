@@ -34,9 +34,11 @@ trait DynHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> BoxFuture<'_>;
-    fn handle_request_batch_boxed(&self, batch: Vec<RequestData>) -> BoxFuture<'_>;
-    fn handle_response_batch_boxed(&self, batch: Vec<(RequestData, ResponseData)>)
-        -> BoxFuture<'_>;
+    fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a>;
+    fn handle_response_batch_boxed<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> BoxFuture<'a>;
 }
 
 /// Wrapper that implements DynHandler for any RequestHandler.
@@ -57,14 +59,14 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         Box::pin(self.inner.handle_response(request_data, response_data))
     }
 
-    fn handle_request_batch_boxed(&self, batch: Vec<RequestData>) -> BoxFuture<'_> {
+    fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a> {
         Box::pin(self.inner.handle_request_batch(batch))
     }
 
-    fn handle_response_batch_boxed(
-        &self,
-        batch: Vec<(RequestData, ResponseData)>,
-    ) -> BoxFuture<'_> {
+    fn handle_response_batch_boxed<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> BoxFuture<'a> {
         Box::pin(self.inner.handle_response_batch(batch))
     }
 }
@@ -151,46 +153,22 @@ impl RequestHandler for MultiHandler {
         futures::future::join_all(futures).await;
     }
 
-    async fn handle_request_batch(&self, batch: Vec<RequestData>) {
-        let n = self.handlers.len();
-        if n == 0 {
-            return;
-        }
-        // Clone for all handlers except the last; move the original to the last
-        // to avoid one full batch clone (significant with large bodies/headers).
-        let mut futs: Vec<BoxFuture<'_>> = Vec::with_capacity(n);
-        for h in &self.handlers[..n - 1] {
-            let b = batch.clone();
-            let h = h.clone();
-            futs.push(Box::pin(
-                async move { h.handle_request_batch_boxed(b).await },
-            ));
-        }
-        let h = self.handlers[n - 1].clone();
-        futs.push(Box::pin(async move {
-            h.handle_request_batch_boxed(batch).await
-        }));
-        futures::future::join_all(futs).await;
+    async fn handle_request_batch(&self, batch: &[RequestData]) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.handle_request_batch_boxed(batch))
+            .collect();
+        futures::future::join_all(futures).await;
     }
 
-    async fn handle_response_batch(&self, batch: Vec<(RequestData, ResponseData)>) {
-        let n = self.handlers.len();
-        if n == 0 {
-            return;
-        }
-        let mut futs: Vec<BoxFuture<'_>> = Vec::with_capacity(n);
-        for h in &self.handlers[..n - 1] {
-            let b = batch.clone();
-            let h = h.clone();
-            futs.push(Box::pin(
-                async move { h.handle_response_batch_boxed(b).await },
-            ));
-        }
-        let h = self.handlers[n - 1].clone();
-        futs.push(Box::pin(async move {
-            h.handle_response_batch_boxed(batch).await
-        }));
-        futures::future::join_all(futs).await;
+    async fn handle_response_batch(&self, batch: &[(RequestData, ResponseData)]) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.handle_response_batch_boxed(batch))
+            .collect();
+        futures::future::join_all(futures).await;
     }
 }
 
@@ -386,7 +364,7 @@ mod tests {
             create_test_request_data(),
         ];
 
-        handler.handle_request_batch(batch).await;
+        handler.handle_request_batch(&batch).await;
 
         // Each handler should process all 3 items via default batch impl
         assert_eq!(request_count1.load(Ordering::SeqCst), 3);
@@ -413,7 +391,7 @@ mod tests {
             (create_test_request_data(), create_test_response_data()),
         ];
 
-        handler.handle_response_batch(batch).await;
+        handler.handle_response_batch(&batch).await;
 
         // Each handler should process all 2 items via default batch impl
         assert_eq!(response_count1.load(Ordering::SeqCst), 2);
@@ -441,7 +419,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             tokio::time::Duration::from_secs(1),
-            handler.handle_request_batch(batch),
+            handler.handle_request_batch(&batch),
         )
         .await;
 

@@ -300,18 +300,19 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// Handle a batch of captured HTTP requests.
     ///
     /// Called by the background task with all requests that have accumulated since
-    /// the last flush. The default implementation calls [`handle_request`] for each
-    /// item concurrently via `join_all`.
+    /// the last flush. The default implementation clones each item and calls
+    /// [`handle_request`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT).
+    /// Override this method to perform bulk operations (e.g. batch INSERT)
+    /// that can borrow directly from the slice without cloning.
     fn handle_request_batch(
         &self,
-        batch: Vec<RequestData>,
+        batch: &[RequestData],
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let futures: Vec<_> = batch
-                .into_iter()
-                .map(|data| self.handle_request(data))
+                .iter()
+                .map(|data| self.handle_request(data.clone()))
                 .collect();
             futures::future::join_all(futures).await;
         }
@@ -320,18 +321,19 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// Handle a batch of captured HTTP responses.
     ///
     /// Called by the background task with all responses that have accumulated since
-    /// the last flush. The default implementation calls [`handle_response`] for each
-    /// item concurrently via `join_all`.
+    /// the last flush. The default implementation clones each item and calls
+    /// [`handle_response`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT).
+    /// Override this method to perform bulk operations (e.g. batch INSERT)
+    /// that can borrow directly from the slice without cloning.
     fn handle_response_batch(
         &self,
-        batch: Vec<(RequestData, ResponseData)>,
+        batch: &[(RequestData, ResponseData)],
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let futures: Vec<_> = batch
-                .into_iter()
-                .map(|(req, res)| self.handle_response(req, res))
+                .iter()
+                .map(|(req, res)| self.handle_response(req.clone(), res.clone()))
                 .collect();
             futures::future::join_all(futures).await;
         }
@@ -458,7 +460,7 @@ impl RequestLoggerLayer {
                 let req_handle = if !request_batch.is_empty() {
                     let h = handler.clone();
                     Some(tokio::spawn(async move {
-                        h.handle_request_batch(request_batch).await;
+                        h.handle_request_batch(&request_batch).await;
                     }))
                 } else {
                     None
@@ -470,7 +472,7 @@ impl RequestLoggerLayer {
                             "outlet.handle_response_batch",
                             batch_size = response_batch.len(),
                         );
-                        h.handle_response_batch(response_batch)
+                        h.handle_response_batch(&response_batch)
                             .instrument(span)
                             .await;
                     }))
