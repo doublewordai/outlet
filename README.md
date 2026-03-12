@@ -92,6 +92,7 @@ use outlet::{RequestLoggerConfig, RequestLoggerLayer, LoggingHandler};
 let config = RequestLoggerConfig {
     capture_request_body: true,     // Whether to capture request bodies
     capture_response_body: true,    // Whether to capture response bodies
+    ..Default::default()
 };
 
 let handler = LoggingHandler;

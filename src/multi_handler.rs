@@ -152,29 +152,45 @@ impl RequestHandler for MultiHandler {
     }
 
     async fn handle_request_batch(&self, batch: Vec<RequestData>) {
-        let futures: Vec<_> = self
-            .handlers
-            .iter()
-            .map(|h| {
-                let batch = batch.clone();
-                let handler = h.clone();
-                async move { handler.handle_request_batch_boxed(batch).await }
-            })
-            .collect();
-        futures::future::join_all(futures).await;
+        let n = self.handlers.len();
+        if n == 0 {
+            return;
+        }
+        // Clone for all handlers except the last; move the original to the last
+        // to avoid one full batch clone (significant with large bodies/headers).
+        let mut futs: Vec<BoxFuture<'_>> = Vec::with_capacity(n);
+        for h in &self.handlers[..n - 1] {
+            let b = batch.clone();
+            let h = h.clone();
+            futs.push(Box::pin(
+                async move { h.handle_request_batch_boxed(b).await },
+            ));
+        }
+        let h = self.handlers[n - 1].clone();
+        futs.push(Box::pin(async move {
+            h.handle_request_batch_boxed(batch).await
+        }));
+        futures::future::join_all(futs).await;
     }
 
     async fn handle_response_batch(&self, batch: Vec<(RequestData, ResponseData)>) {
-        let futures: Vec<_> = self
-            .handlers
-            .iter()
-            .map(|h| {
-                let batch = batch.clone();
-                let handler = h.clone();
-                async move { handler.handle_response_batch_boxed(batch).await }
-            })
-            .collect();
-        futures::future::join_all(futures).await;
+        let n = self.handlers.len();
+        if n == 0 {
+            return;
+        }
+        let mut futs: Vec<BoxFuture<'_>> = Vec::with_capacity(n);
+        for h in &self.handlers[..n - 1] {
+            let b = batch.clone();
+            let h = h.clone();
+            futs.push(Box::pin(
+                async move { h.handle_response_batch_boxed(b).await },
+            ));
+        }
+        let h = self.handlers[n - 1].clone();
+        futs.push(Box::pin(async move {
+            h.handle_response_batch_boxed(batch).await
+        }));
+        futures::future::join_all(futs).await;
     }
 }
 

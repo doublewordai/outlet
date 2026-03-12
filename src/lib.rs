@@ -177,6 +177,7 @@ fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes
 ///     capture_request_body: true,
 ///     capture_response_body: false,
 ///     path_filter: None,
+///     ..Default::default()
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -187,6 +188,11 @@ pub struct RequestLoggerConfig {
     pub capture_response_body: bool,
     /// Optional path filter to skip body capture for requests that don't match
     pub path_filter: Option<PathFilter>,
+    /// Capacity of the bounded channel between the middleware and the background
+    /// processing task. When the channel is full, new items are dropped (with a
+    /// counter increment on `outlet_queue_dropped_total`) rather than applying
+    /// backpressure to the request path. Default: 4096.
+    pub channel_capacity: usize,
 }
 
 /// Filter configuration for determining which requests to capture.
@@ -209,6 +215,7 @@ impl Default for RequestLoggerConfig {
             capture_request_body: true,
             capture_response_body: true,
             path_filter: None,
+            channel_capacity: 4096,
         }
     }
 }
@@ -364,7 +371,7 @@ pub trait RequestHandler: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct RequestLoggerLayer {
     config: RequestLoggerConfig,
-    tx: mpsc::UnboundedSender<BackgroundTask>,
+    tx: mpsc::Sender<BackgroundTask>,
 }
 
 impl RequestLoggerLayer {
@@ -389,6 +396,7 @@ impl RequestLoggerLayer {
     ///     capture_request_body: true,
     ///     capture_response_body: true,
     ///     path_filter: None,
+    ///     ..Default::default()
     /// };
     /// let handler = LoggingHandler;
     ///
@@ -400,7 +408,7 @@ impl RequestLoggerLayer {
     /// # }
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<BackgroundTask>();
+        let (tx, mut rx) = mpsc::channel::<BackgroundTask>(config.channel_capacity);
         let handler = Arc::new(handler);
         let handler_clone = handler.clone();
 
@@ -509,7 +517,7 @@ impl<S> Layer<S> for RequestLoggerLayer {
 pub struct RequestLoggerService<S> {
     inner: S,
     config: RequestLoggerConfig,
-    tx: mpsc::UnboundedSender<BackgroundTask>,
+    tx: mpsc::Sender<BackgroundTask>,
 }
 
 impl<S> Service<Request> for RequestLoggerService<S>
@@ -616,10 +624,11 @@ where
                 span_id: span_id.clone(),
             };
 
-            if let Err(e) = tx_for_request.send(BackgroundTask::Request {
+            if let Err(e) = tx_for_request.try_send(BackgroundTask::Request {
                 data: request_data.clone(),
             }) {
-                error!(correlation_id = %correlation_id, error = %e, "Failed to send request data to background task");
+                counter!("outlet_queue_dropped_total").increment(1);
+                error!(correlation_id = %correlation_id, error = %e, "Dropped request data: channel full or closed");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
             counter!("outlet_queue_enqueued_total").increment(1);
@@ -700,13 +709,14 @@ where
                         };
 
                         if tx_for_response
-                            .send(BackgroundTask::Response {
+                            .try_send(BackgroundTask::Response {
                                 request_data,
                                 response_data,
                             })
                             .is_err()
                         {
-                            error!(correlation_id = %correlation_id, "Failed to send response data to background task");
+                            counter!("outlet_queue_dropped_total").increment(1);
+                            error!(correlation_id = %correlation_id, "Dropped response data: channel full or closed");
                         } else {
                             counter!("outlet_queue_enqueued_total").increment(1);
                         }
