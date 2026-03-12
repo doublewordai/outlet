@@ -34,6 +34,9 @@ trait DynHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> BoxFuture<'_>;
+    fn handle_request_batch_boxed(&self, batch: Vec<RequestData>) -> BoxFuture<'_>;
+    fn handle_response_batch_boxed(&self, batch: Vec<(RequestData, ResponseData)>)
+        -> BoxFuture<'_>;
 }
 
 /// Wrapper that implements DynHandler for any RequestHandler.
@@ -52,6 +55,17 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         response_data: ResponseData,
     ) -> BoxFuture<'_> {
         Box::pin(self.inner.handle_response(request_data, response_data))
+    }
+
+    fn handle_request_batch_boxed(&self, batch: Vec<RequestData>) -> BoxFuture<'_> {
+        Box::pin(self.inner.handle_request_batch(batch))
+    }
+
+    fn handle_response_batch_boxed(
+        &self,
+        batch: Vec<(RequestData, ResponseData)>,
+    ) -> BoxFuture<'_> {
+        Box::pin(self.inner.handle_response_batch(batch))
     }
 }
 
@@ -132,6 +146,32 @@ impl RequestHandler for MultiHandler {
                 let res = response_data.clone();
                 let handler = h.clone();
                 async move { handler.handle_response_boxed(req, res).await }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_request_batch(&self, batch: Vec<RequestData>) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| {
+                let batch = batch.clone();
+                let handler = h.clone();
+                async move { handler.handle_request_batch_boxed(batch).await }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_response_batch(&self, batch: Vec<(RequestData, ResponseData)>) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| {
+                let batch = batch.clone();
+                let handler = h.clone();
+                async move { handler.handle_response_batch_boxed(batch).await }
             })
             .collect();
         futures::future::join_all(futures).await;
