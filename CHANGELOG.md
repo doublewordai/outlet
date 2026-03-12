@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/doublewordai/outlet/compare/v0.7.0...v0.8.0) - 2026-03-12
+
+### Added
+
+- [**breaking**] batch dispatch for request handlers ([#64](https://github.com/doublewordai/outlet/pull/64))
+
+### Other
+
+- fix quadratic body chunk concatenation ([#59](https://github.com/doublewordai/outlet/pull/59))
+
 ## [0.7.0](https://github.com/doublewordai/outlet/compare/v0.6.1...v0.7.0) - 2026-03-11
 
 ### Added
