@@ -443,26 +443,42 @@ impl RequestLoggerLayer {
                     }
                 }
 
-                // Dispatch request and response batches concurrently
+                // Dispatch request and response batches concurrently.
+                // Each batch is spawned as a task so a panic in one handler
+                // doesn't kill the background loop.
                 let handler = handler_clone.clone();
-                let req_fut = async {
-                    if !request_batch.is_empty() {
-                        handler.handle_request_batch(request_batch).await;
-                    }
+                let req_handle = if !request_batch.is_empty() {
+                    let h = handler.clone();
+                    Some(tokio::spawn(async move {
+                        h.handle_request_batch(request_batch).await;
+                    }))
+                } else {
+                    None
                 };
-                let res_fut = async {
-                    if !response_batch.is_empty() {
+                let res_handle = if !response_batch.is_empty() {
+                    let h = handler.clone();
+                    Some(tokio::spawn(async move {
                         let span = tracing::info_span!(
                             "outlet.handle_response_batch",
                             batch_size = response_batch.len(),
                         );
-                        handler
-                            .handle_response_batch(response_batch)
+                        h.handle_response_batch(response_batch)
                             .instrument(span)
                             .await;
-                    }
+                    }))
+                } else {
+                    None
                 };
-                futures::future::join(req_fut, res_fut).await;
+                if let Some(handle) = req_handle {
+                    if let Err(e) = handle.await {
+                        error!("Request batch handler panicked: {}", e);
+                    }
+                }
+                if let Some(handle) = res_handle {
+                    if let Err(e) = handle.await {
+                        error!("Response batch handler panicked: {}", e);
+                    }
+                }
             }
         });
 
