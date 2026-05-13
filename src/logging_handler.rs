@@ -60,4 +60,13 @@ impl RequestHandler for LoggingHandler {
             "Response captured"
         );
     }
+
+    async fn handle_abandoned(&self, data: RequestData) {
+        info!(
+            correlation_id = %data.correlation_id,
+            method = %data.method,
+            uri = %data.uri,
+            "Request abandoned (client cancelled before response)"
+        );
+    }
 }

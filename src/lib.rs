@@ -272,6 +272,58 @@ impl PathFilter {
 ///     }
 /// }
 /// ```
+/// Drop-fired sentinel that `try_send`s a [`BackgroundTask::Abandoned`] if
+/// not [`disarm`](Self::disarm)ed first.
+///
+/// Used by [`RequestLoggerService::call`] to detect the "client cancelled
+/// before any response was produced" path: the outer future is dropped
+/// before reaching the `Ok(response)` arm, so the detached response task
+/// is never spawned and `BackgroundTask::Response` never fires. The guard
+/// catches that drop and feeds an `Abandoned` event into the same
+/// background channel.
+///
+/// The send is best-effort (`try_send`) because Drop runs synchronously
+/// and can't await; if the channel is full or closed, the abandon event is
+/// dropped along with the `outlet_queue_dropped_total` counter, same as
+/// other tasks under back-pressure.
+struct AbandonGuard {
+    tx: mpsc::Sender<BackgroundTask>,
+    data: Option<RequestData>,
+}
+
+impl AbandonGuard {
+    fn new(tx: mpsc::Sender<BackgroundTask>, data: RequestData) -> Self {
+        Self {
+            tx,
+            data: Some(data),
+        }
+    }
+
+    /// Consume the held request data so the guard's Drop becomes a no-op.
+    /// Called once the inner future yields a value — at that point the
+    /// outer flow has either spawned the response task (Ok) or returned
+    /// an error (Err), and neither case is abandonment.
+    fn disarm(&mut self) {
+        self.data.take();
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            if self
+                .tx
+                .try_send(BackgroundTask::Abandoned { data })
+                .is_err()
+            {
+                counter!("outlet_queue_dropped_total").increment(1);
+            } else {
+                counter!("outlet_queue_enqueued_total").increment(1);
+            }
+        }
+    }
+}
+
 pub trait RequestHandler: Send + Sync + 'static {
     /// Handle a captured HTTP request.
     ///
@@ -296,6 +348,30 @@ pub trait RequestHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Handle a request whose handler future was dropped before a response
+    /// was produced.
+    ///
+    /// This fires when the inner service future is dropped before completing
+    /// — typically because the client cancelled the connection while an
+    /// upstream call was still in flight. The `request_data` carries
+    /// whatever was captured at request time; the request body may be
+    /// `None` even if capture was enabled, because body capture races the
+    /// inner-future drop.
+    ///
+    /// Default implementation is a no-op so adding this trait method is not
+    /// a breaking change. Override it if you maintain per-request state
+    /// that needs cleanup on abandonment (e.g. terminating a row that
+    /// `handle_response` would otherwise have finalized).
+    ///
+    /// Note that this hook only fires for the "client cancelled before
+    /// response started" path. If the response began streaming and the
+    /// client then dropped, `handle_response` fires with whatever body was
+    /// captured before the stream broke — outlet's response-task spawn
+    /// outlives the outer future once the inner service yields headers.
+    fn handle_abandoned(&self, _data: RequestData) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 
     /// Handle a batch of captured HTTP requests.
     ///
@@ -334,6 +410,23 @@ pub trait RequestHandler: Send + Sync + 'static {
             let futures: Vec<_> = batch
                 .iter()
                 .map(|(req, res)| self.handle_response(req.clone(), res.clone()))
+                .collect();
+            futures::future::join_all(futures).await;
+        }
+    }
+
+    /// Handle a batch of abandoned requests.
+    ///
+    /// Default implementation calls [`handle_abandoned`] for each item
+    /// concurrently. Override for bulk operations.
+    fn handle_abandoned_batch(
+        &self,
+        batch: &[RequestData],
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            let futures: Vec<_> = batch
+                .iter()
+                .map(|data| self.handle_abandoned(data.clone()))
                 .collect();
             futures::future::join_all(futures).await;
         }
@@ -434,9 +527,10 @@ impl RequestLoggerLayer {
 
                 counter!("outlet_queue_dequeued_total").increment(tasks.len() as u64);
 
-                // Separate into request and response batches
+                // Separate into request, response, and abandoned batches
                 let mut request_batch = Vec::new();
                 let mut response_batch = Vec::new();
+                let mut abandoned_batch = Vec::new();
 
                 for task in tasks {
                     match task {
@@ -450,12 +544,14 @@ impl RequestLoggerLayer {
                         } => {
                             response_batch.push((request_data, response_data));
                         }
+                        BackgroundTask::Abandoned { data } => {
+                            abandoned_batch.push(data);
+                        }
                     }
                 }
 
-                // Dispatch request and response batches concurrently.
-                // Each batch is spawned as a task so a panic in one handler
-                // doesn't kill the background loop.
+                // Dispatch batches concurrently. Each batch is spawned as a
+                // task so a panic in one handler doesn't kill the loop.
                 let handler = handler_clone.clone();
                 let req_handle = if !request_batch.is_empty() {
                     let h = handler.clone();
@@ -479,6 +575,20 @@ impl RequestLoggerLayer {
                 } else {
                     None
                 };
+                let abandoned_handle = if !abandoned_batch.is_empty() {
+                    let h = handler.clone();
+                    Some(tokio::spawn(async move {
+                        let span = tracing::info_span!(
+                            "outlet.handle_abandoned_batch",
+                            batch_size = abandoned_batch.len(),
+                        );
+                        h.handle_abandoned_batch(&abandoned_batch)
+                            .instrument(span)
+                            .await;
+                    }))
+                } else {
+                    None
+                };
                 if let Some(handle) = req_handle {
                     if let Err(e) = handle.await {
                         error!("Request batch handler panicked: {}", e);
@@ -487,6 +597,11 @@ impl RequestLoggerLayer {
                 if let Some(handle) = res_handle {
                     if let Err(e) = handle.await {
                         error!("Response batch handler panicked: {}", e);
+                    }
+                }
+                if let Some(handle) = abandoned_handle {
+                    if let Err(e) = handle.await {
+                        error!("Abandoned batch handler panicked: {}", e);
                     }
                 }
             }
@@ -587,6 +702,10 @@ where
                 (None, None)
             }
         };
+        // Cloned copies for the abandon guard built below — the originals are
+        // moved into the request_data_future spawn.
+        let trace_id_for_abandon = trace_id.clone();
+        let span_id_for_abandon = span_id.clone();
 
         trace!(method = %method, uri = %uri, correlation_id = %correlation_id, "Starting request processing");
 
@@ -640,10 +759,36 @@ where
 
         let future = self.inner.call(request);
 
+        // Drop guard for the "client cancelled before any response" path.
+        // If the outer future is dropped between here and the `Ok(response)`
+        // arm (which spawns a detached task that owns continuation), the
+        // guard's Drop synchronously try_sends a `BackgroundTask::Abandoned`
+        // so handlers can clean up per-request state. We build a minimal
+        // RequestData with no body — the real body capture races the inner
+        // drop and isn't guaranteed to land — and feed it to the guard.
+        // After we reach `Ok(response)`, the guard is disarmed so normal
+        // completion doesn't double-fire alongside `BackgroundTask::Response`.
+        let abandon_data = RequestData {
+            correlation_id,
+            timestamp: start_time,
+            method,
+            uri,
+            headers: convert_headers(&headers),
+            body: None,
+            trace_id: trace_id_for_abandon,
+            span_id: span_id_for_abandon,
+        };
+        let mut abandon_guard = AbandonGuard::new(self.tx.clone(), abandon_data);
+
         Box::pin(async move {
             trace!("Awaiting inner service response");
             let result = future.await;
             trace!("Inner service response received");
+
+            // Inner future resolved (Ok or Err) — not an abandonment. Disarm
+            // before the match so neither arm double-fires alongside the
+            // detached response task or with an Err return.
+            abandon_guard.disarm();
 
             match result {
                 Ok(mut response) => {

@@ -97,4 +97,9 @@ pub(crate) enum BackgroundTask {
         request_data: RequestData,
         response_data: ResponseData,
     },
+    /// The request's handler future was dropped before any response was
+    /// produced — typically because the client cancelled the connection
+    /// while the upstream call was still in flight. Carries the request
+    /// data captured so far so handlers can correlate and clean up.
+    Abandoned { data: RequestData },
 }

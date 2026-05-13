@@ -25,6 +25,7 @@ use std::collections::HashMap;
 struct TestHandler {
     requests: Arc<Mutex<Vec<(RequestData, u64)>>>,
     responses: Arc<Mutex<Vec<(ResponseData, u64)>>>,
+    abandoned: Arc<Mutex<Vec<(RequestData, u64)>>>,
     completed_pairs: Arc<Mutex<HashMap<u64, (RequestData, ResponseData)>>>,
 }
 
@@ -33,6 +34,7 @@ impl TestHandler {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(Vec::new())),
+            abandoned: Arc::new(Mutex::new(Vec::new())),
             completed_pairs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -43,6 +45,10 @@ impl TestHandler {
 
     fn get_responses(&self) -> Vec<(ResponseData, u64)> {
         self.responses.lock().unwrap().clone()
+    }
+
+    fn get_abandoned(&self) -> Vec<(RequestData, u64)> {
+        self.abandoned.lock().unwrap().clone()
     }
 
     fn get_completed_pairs(&self) -> Vec<(u64, RequestData, ResponseData)> {
@@ -57,6 +63,17 @@ impl TestHandler {
         let start = SystemTime::now();
         while start.elapsed().unwrap() < timeout {
             if self.completed_pairs.lock().unwrap().len() >= expected_count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn wait_for_abandoned(&self, expected_count: usize, timeout: Duration) -> bool {
+        let start = SystemTime::now();
+        while start.elapsed().unwrap() < timeout {
+            if self.abandoned.lock().unwrap().len() >= expected_count {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -84,6 +101,13 @@ impl RequestHandler for TestHandler {
             .lock()
             .unwrap()
             .insert(request_data.correlation_id, (request_data, response_data));
+    }
+
+    async fn handle_abandoned(&self, data: RequestData) {
+        self.abandoned
+            .lock()
+            .unwrap()
+            .push((data.clone(), data.correlation_id));
     }
 }
 
@@ -594,6 +618,93 @@ async fn test_default_batch_impl_calls_individual_methods() {
     ];
     handler.handle_response_batch(&batch).await;
     assert_eq!(response_count.load(Ordering::SeqCst), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Abandoned-request tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_fires_when_outer_future_dropped_mid_request() {
+    use tower::ServiceExt;
+
+    // Inner handler that never resolves — simulates an upstream that's
+    // still working when the client drops.
+    async fn pending_handler() -> impl IntoResponse {
+        std::future::pending::<()>().await;
+        "unreachable"
+    }
+
+    let handler = TestHandler::new();
+    let app: Router = Router::new().route("/pending", get(pending_handler)).layer(
+        ServiceBuilder::new()
+            .layer(RequestLoggerLayer::new(
+                RequestLoggerConfig::default(),
+                handler.clone(),
+            ))
+            .into_inner(),
+    );
+
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/pending")
+        .body(Body::empty())
+        .unwrap();
+
+    // Drive the service and drop the future via timeout. The drop is what
+    // triggers the AbandonGuard's Drop impl in RequestLoggerService::call.
+    let response_future = app.oneshot(request);
+    let result = tokio::time::timeout(Duration::from_millis(100), response_future).await;
+    assert!(
+        result.is_err(),
+        "pending_handler should never resolve — timeout (and drop) is the test path"
+    );
+
+    // Give the background task a moment to dispatch the Abandoned event.
+    assert!(
+        handler.wait_for_abandoned(1, Duration::from_secs(2)),
+        "expected one abandoned event after dropping the request future"
+    );
+    let abandoned = handler.get_abandoned();
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].0.method, Method::GET);
+    assert_eq!(abandoned[0].0.uri.path(), "/pending");
+    // No response should have been captured for the abandoned request.
+    assert!(handler.get_responses().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_does_not_fire_on_normal_completion() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let handler = TestHandler::new();
+    let app: Router = Router::new().route("/hello", get(hello_handler)).layer(
+        ServiceBuilder::new()
+            .layer(RequestLoggerLayer::new(
+                RequestLoggerConfig::default(),
+                handler.clone(),
+            ))
+            .into_inner(),
+    );
+
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/hello")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Drain the body so the outlet capture stream completes — without this,
+    // the response-task spawn is still awaiting body chunks that never flow
+    // (tower::ServiceExt::oneshot returns the response without consuming
+    // the body), and handle_response never fires.
+    let _ = response.into_body().collect().await.unwrap();
+
+    // Wait for the normal response to be captured.
+    assert!(handler.wait_for_pairs(1, Duration::from_secs(2)));
+    // Critically: no abandoned event — the guard was disarmed.
+    assert!(handler.get_abandoned().is_empty());
 }
 
 // ---------------------------------------------------------------------------
