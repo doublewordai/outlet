@@ -34,11 +34,13 @@ trait DynHandler: Send + Sync + 'static {
         request_data: RequestData,
         response_data: ResponseData,
     ) -> BoxFuture<'_>;
+    fn handle_abandoned_boxed(&self, data: RequestData) -> BoxFuture<'_>;
     fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a>;
     fn handle_response_batch_boxed<'a>(
         &'a self,
         batch: &'a [(RequestData, ResponseData)],
     ) -> BoxFuture<'a>;
+    fn handle_abandoned_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a>;
 }
 
 /// Wrapper that implements DynHandler for any RequestHandler.
@@ -59,6 +61,10 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         Box::pin(self.inner.handle_response(request_data, response_data))
     }
 
+    fn handle_abandoned_boxed(&self, data: RequestData) -> BoxFuture<'_> {
+        Box::pin(self.inner.handle_abandoned(data))
+    }
+
     fn handle_request_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a> {
         Box::pin(self.inner.handle_request_batch(batch))
     }
@@ -68,6 +74,10 @@ impl<H: RequestHandler> DynHandler for HandlerWrapper<H> {
         batch: &'a [(RequestData, ResponseData)],
     ) -> BoxFuture<'a> {
         Box::pin(self.inner.handle_response_batch(batch))
+    }
+
+    fn handle_abandoned_batch_boxed<'a>(&'a self, batch: &'a [RequestData]) -> BoxFuture<'a> {
+        Box::pin(self.inner.handle_abandoned_batch(batch))
     }
 }
 
@@ -167,6 +177,28 @@ impl RequestHandler for MultiHandler {
             .handlers
             .iter()
             .map(|h| h.handle_response_batch_boxed(batch))
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_abandoned(&self, data: RequestData) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| {
+                let data = data.clone();
+                let handler = h.clone();
+                async move { handler.handle_abandoned_boxed(data).await }
+            })
+            .collect();
+        futures::future::join_all(futures).await;
+    }
+
+    async fn handle_abandoned_batch(&self, batch: &[RequestData]) {
+        let futures: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.handle_abandoned_batch_boxed(batch))
             .collect();
         futures::future::join_all(futures).await;
     }
