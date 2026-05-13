@@ -355,20 +355,36 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// This fires when the inner service future is dropped before completing
     /// — typically because the client cancelled the connection while an
     /// upstream call was still in flight. The `request_data` carries
-    /// whatever was captured at request time; the request body may be
-    /// `None` even if capture was enabled, because body capture races the
-    /// inner-future drop.
+    /// whatever was captured synchronously at request time; the request
+    /// body is always `None` because body capture is decoupled (it lives
+    /// on a separate spawned task) and racing it would slow down the
+    /// abandon path's `try_send`.
     ///
     /// Default implementation is a no-op so adding this trait method is not
     /// a breaking change. Override it if you maintain per-request state
     /// that needs cleanup on abandonment (e.g. terminating a row that
     /// `handle_response` would otherwise have finalized).
     ///
-    /// Note that this hook only fires for the "client cancelled before
-    /// response started" path. If the response began streaming and the
-    /// client then dropped, `handle_response` fires with whatever body was
-    /// captured before the stream broke — outlet's response-task spawn
-    /// outlives the outer future once the inner service yields headers.
+    /// # Relationship to `handle_request` and `handle_response`
+    ///
+    /// `handle_request` runs from a task spawned independently of the
+    /// inner service future; it may fire *before* `handle_abandoned`,
+    /// *after*, or not at all, depending on whether request body capture
+    /// completes before the drop. Handlers must NOT assume `handle_request`
+    /// has already been processed when `handle_abandoned` fires, and any
+    /// state created in `handle_request` should be cleaned up
+    /// idempotently here.
+    ///
+    /// `handle_response` and `handle_abandoned` are mutually exclusive for
+    /// a given request: the same drop guard that fires `Abandoned` is
+    /// disarmed the moment the inner future resolves to `Ok(response)` (at
+    /// which point a detached task takes over and fires `Response`).
+    ///
+    /// This hook only fires for the "client cancelled before response
+    /// started" path. If the response began streaming and the client then
+    /// dropped, `handle_response` fires with whatever body was captured
+    /// before the stream broke — outlet's response-task spawn outlives the
+    /// outer future once the inner service yields headers.
     fn handle_abandoned(&self, _data: RequestData) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }

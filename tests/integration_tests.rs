@@ -674,6 +674,54 @@ async fn test_abandoned_fires_when_outer_future_dropped_mid_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_does_not_fire_when_inner_service_returns_err() {
+    use tower::{Layer, Service, ServiceExt};
+
+    // Manual Error impl rather than pulling in thiserror as a dev-dep.
+    #[derive(Debug)]
+    struct SimulatedError;
+    impl std::fmt::Display for SimulatedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "simulated inner-service error")
+        }
+    }
+    impl std::error::Error for SimulatedError {}
+
+    let handler = TestHandler::new();
+
+    // tower::service_fn with a non-Infallible Error type so the inner
+    // future actually has an Err arm to exercise. axum::Router can't be
+    // used here because its Error is Infallible — 5xx HTTP responses come
+    // back through the Ok(response) arm, not as Err.
+    let inner = tower::service_fn(|_req: axum::http::Request<axum::body::Body>| async move {
+        Err::<axum::response::Response, SimulatedError>(SimulatedError)
+    });
+    let layer = RequestLoggerLayer::new(RequestLoggerConfig::default(), handler.clone());
+    let mut service = layer.layer(inner);
+
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/err")
+        .body(Body::empty())
+        .unwrap();
+    let result: Result<axum::response::Response, SimulatedError> =
+        service.ready().await.unwrap().call(request).await;
+    assert!(result.is_err(), "inner returned Err — outer must propagate");
+
+    // Let the background loop drain.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // disarm() is called before the match on result, so Err propagation
+    // is NOT abandonment — guard didn't fire.
+    assert!(
+        handler.get_abandoned().is_empty(),
+        "Err arm of future.await must disarm the guard; abandoned must not fire"
+    );
+    // And no response either, because we never reached Ok(response).
+    assert!(handler.get_responses().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_abandoned_does_not_fire_on_normal_completion() {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
