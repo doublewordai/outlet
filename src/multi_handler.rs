@@ -249,6 +249,7 @@ mod tests {
             body: None,
             duration_to_first_byte: Duration::from_millis(10),
             duration: Duration::from_millis(100),
+            extensions: Default::default(),
         }
     }
 

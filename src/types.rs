@@ -3,7 +3,7 @@
 //! This module contains the core data structures used to represent captured
 //! HTTP requests and responses, along with background task types.
 
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{Extensions, Method, StatusCode, Uri};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -78,6 +78,11 @@ pub struct ResponseData {
     /// For non-streaming responses, this equals duration_to_first_byte.
     /// For streaming responses, this is the time until the stream fully completes.
     pub duration: Duration,
+    /// Response extensions as set by inner services/handlers, cloned at capture
+    /// time. Extensions never serialize to the wire, so this is the only way for
+    /// handlers to receive typed per-request annotations (e.g. routing decisions)
+    /// from the layers that produced the response.
+    pub extensions: Extensions,
 }
 
 /// Tasks sent to the background processing task.
