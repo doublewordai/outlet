@@ -211,10 +211,13 @@ async fn test_response_extensions_reach_handler() {
     let response = server.get("/annotated").await;
     assert_eq!(response.status_code(), StatusCode::OK);
 
-    // Yield to the background processing task before the blocking wait
-    // (wait_for_pairs thread-sleeps, which would starve a current-thread runtime).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(handler.wait_for_pairs(1, Duration::from_secs(1)));
+    // wait_for_pairs thread-sleeps; run it on the blocking pool so the runtime
+    // keeps driving the background processing task while we wait.
+    let waiter = handler.clone();
+    let found = tokio::task::spawn_blocking(move || waiter.wait_for_pairs(1, Duration::from_secs(5)))
+        .await
+        .unwrap();
+    assert!(found);
     let pairs = handler.get_completed_pairs();
     assert_eq!(pairs.len(), 1);
     let (_, _, response_data) = &pairs[0];
