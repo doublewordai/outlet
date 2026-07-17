@@ -810,6 +810,7 @@ where
                 Ok(mut response) => {
                     let response_headers = response.headers().clone();
                     let response_status = response.status();
+                    let response_extensions = response.extensions().clone();
                     let first_byte_time = SystemTime::now();
                     let duration_to_first_byte = first_byte_time
                         .duration_since(start_time)
@@ -869,6 +870,7 @@ where
                             body,
                             duration_to_first_byte,
                             duration: total_duration,
+                            extensions: response_extensions,
                         };
 
                         if tx_for_response

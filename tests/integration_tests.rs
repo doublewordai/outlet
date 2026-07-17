@@ -187,6 +187,48 @@ async fn test_basic_request_response() {
 }
 
 #[tokio::test]
+async fn test_response_extensions_reach_handler() {
+    /// Typed annotation an inner service attaches to its response — the
+    /// pattern integrators use to pass routing decisions to the handler.
+    #[derive(Clone, Debug, PartialEq)]
+    struct RoutingAnnotation(&'static str);
+
+    async fn annotating_handler() -> impl IntoResponse {
+        let mut response = "annotated".into_response();
+        response
+            .extensions_mut()
+            .insert(RoutingAnnotation("upstream-a"));
+        response
+    }
+
+    let handler = TestHandler::new();
+    let config = RequestLoggerConfig::default();
+    let app = Router::new()
+        .route("/annotated", get(annotating_handler))
+        .layer(RequestLoggerLayer::new(config, handler.clone()));
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    let response = server.get("/annotated").await;
+    assert_eq!(response.status_code(), StatusCode::OK);
+
+    // wait_for_pairs thread-sleeps; run it on the blocking pool so the runtime
+    // keeps driving the background processing task while we wait.
+    let waiter = handler.clone();
+    let found =
+        tokio::task::spawn_blocking(move || waiter.wait_for_pairs(1, Duration::from_secs(5)))
+            .await
+            .unwrap();
+    assert!(found);
+    let pairs = handler.get_completed_pairs();
+    assert_eq!(pairs.len(), 1);
+    let (_, _, response_data) = &pairs[0];
+    assert_eq!(
+        response_data.extensions.get::<RoutingAnnotation>(),
+        Some(&RoutingAnnotation("upstream-a"))
+    );
+}
+
+#[tokio::test]
 async fn test_request_with_body_capture() {
     let handler = TestHandler::new();
     let config = RequestLoggerConfig {
@@ -570,6 +612,7 @@ fn make_response_data() -> ResponseData {
         body: None,
         duration_to_first_byte: Duration::from_millis(1),
         duration: Duration::from_millis(10),
+        extensions: Default::default(),
     }
 }
 
