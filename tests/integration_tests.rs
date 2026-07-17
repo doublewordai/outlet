@@ -214,9 +214,10 @@ async fn test_response_extensions_reach_handler() {
     // wait_for_pairs thread-sleeps; run it on the blocking pool so the runtime
     // keeps driving the background processing task while we wait.
     let waiter = handler.clone();
-    let found = tokio::task::spawn_blocking(move || waiter.wait_for_pairs(1, Duration::from_secs(5)))
-        .await
-        .unwrap();
+    let found =
+        tokio::task::spawn_blocking(move || waiter.wait_for_pairs(1, Duration::from_secs(5)))
+            .await
+            .unwrap();
     assert!(found);
     let pairs = handler.get_completed_pairs();
     assert_eq!(pairs.len(), 1);
