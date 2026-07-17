@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/doublewordai/outlet/compare/v0.9.0...v0.9.1) - 2026-07-17
+
+### Fixed
+
+- *(deps)* update rust crate tower-http to 0.7 ([#80](https://github.com/doublewordai/outlet/pull/80))
+
+### Other
+
+- *(deps)* update rust crate metrics to v0.24.6 ([#69](https://github.com/doublewordai/outlet/pull/69))
+- *(deps)* update rust crate serde_json to v1.0.150 ([#77](https://github.com/doublewordai/outlet/pull/77))
+
 ## [0.9.0](https://github.com/doublewordai/outlet/compare/v0.8.1...v0.9.0) - 2026-07-17
 
 ### Added
