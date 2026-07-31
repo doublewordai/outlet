@@ -798,6 +798,69 @@ async fn test_abandoned_does_not_fire_on_normal_completion() {
     assert!(handler.get_abandoned().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_queued_handlers_to_finish() {
+    use http_body_util::BodyExt;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct BlockingHandler {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl RequestHandler for BlockingHandler {
+        async fn handle_request(&self, _request: RequestData) {}
+
+        async fn handle_response(&self, _request: RequestData, _response: ResponseData) {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (layer, shutdown) = RequestLoggerLayer::new_with_shutdown(
+        RequestLoggerConfig::default(),
+        BlockingHandler {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        },
+    );
+    let app: Router = Router::new()
+        .route("/hello", get(hello_handler))
+        .layer(layer);
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/hello")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response.into_body().collect().await.unwrap();
+    started.notified().await;
+
+    drop(app);
+    let mut shutdown = Box::pin(shutdown.shutdown());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must wait for an in-flight handler"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), shutdown)
+        .await
+        .expect("shutdown timed out")
+        .expect("outlet worker panicked");
+}
+
 // ---------------------------------------------------------------------------
 // Panic safety tests
 // ---------------------------------------------------------------------------

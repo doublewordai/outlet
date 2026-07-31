@@ -485,6 +485,22 @@ pub struct RequestLoggerLayer {
     tx: mpsc::Sender<BackgroundTask>,
 }
 
+/// Handle used to drain request logging during graceful shutdown.
+///
+/// Drop every [`RequestLoggerLayer`] and service derived from it before awaiting
+/// this handle. The worker then consumes all queued request data and waits for
+/// every handler batch to finish before returning.
+pub struct RequestLoggerShutdown {
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl RequestLoggerShutdown {
+    /// Wait until the request logger worker and all queued handlers finish.
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+        self.worker.await
+    }
+}
+
 impl RequestLoggerLayer {
     /// Create a new request logger layer with the given configuration and handler.
     ///
@@ -519,6 +535,19 @@ impl RequestLoggerLayer {
     /// # }
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
+        let (layer, _shutdown) = Self::new_with_shutdown(config, handler);
+        layer
+    }
+
+    /// Create a request logger layer and a handle for graceful shutdown.
+    ///
+    /// After the HTTP server has stopped and all clones of the layer/service
+    /// have been dropped, await the returned handle to flush the queue and wait
+    /// for all handler batches to complete.
+    pub fn new_with_shutdown<H: RequestHandler>(
+        config: RequestLoggerConfig,
+        handler: H,
+    ) -> (Self, RequestLoggerShutdown) {
         let (tx, mut rx) = mpsc::channel::<BackgroundTask>(config.channel_capacity);
         let handler = Arc::new(handler);
         let handler_clone = handler.clone();
@@ -527,7 +556,7 @@ impl RequestLoggerLayer {
         // Waits for at least one item, drains all available items, then flushes
         // the batch to the handler. This gives low latency at low load (single
         // item → immediate flush) and batching efficiency at high load.
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             loop {
                 // Block until at least one item arrives (or channel closes)
                 let first = match rx.recv().await {
@@ -623,7 +652,7 @@ impl RequestLoggerLayer {
             }
         });
 
-        Self { config, tx }
+        (Self { config, tx }, RequestLoggerShutdown { worker })
     }
 }
 
