@@ -151,3 +151,5 @@ cargo doc --open
 ## License
 
 This project is licensed under the MIT License.
+
+<!-- workspace-sync-smoke-test: 20260808161904 -->
