@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/doublewordai/outlet/compare/v0.9.1...v0.10.0) - 2026-09-02
+
+### Fixed
+
+- *(deps)* [**breaking**] upgrade to opentelemetry 0.32 / tracing-opentelemetry 0.33 ([#102](https://github.com/doublewordai/outlet/pull/102))
+
 ## [0.9.1](https://github.com/doublewordai/outlet/compare/v0.9.0...v0.9.1) - 2026-07-17
 
 ### Fixed
