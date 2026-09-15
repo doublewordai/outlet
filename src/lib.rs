@@ -189,9 +189,8 @@ pub struct RequestLoggerConfig {
     /// Optional path filter to skip body capture for requests that don't match
     pub path_filter: Option<PathFilter>,
     /// Capacity of the bounded channel between the middleware and the background
-    /// processing task. When the channel is full, new items are dropped (with a
-    /// counter increment on `outlet_queue_dropped_total`) rather than applying
-    /// backpressure to the request path. Default: 4096.
+    /// processing task. Completed request/response captures wait asynchronously
+    /// for capacity rather than being dropped. Default: 4096.
     pub channel_capacity: usize,
 }
 
@@ -282,10 +281,9 @@ impl PathFilter {
 /// catches that drop and feeds an `Abandoned` event into the same
 /// background channel.
 ///
-/// The send is best-effort (`try_send`) because Drop runs synchronously
-/// and can't await; if the channel is full or closed, the abandon event is
-/// dropped along with the `outlet_queue_dropped_total` counter, same as
-/// other tasks under back-pressure.
+/// The send is best-effort (`try_send`) because Drop runs synchronously and
+/// can't await. This is the sole lossy queue path: normal request/response
+/// captures use async `send` and wait for capacity.
 struct AbandonGuard {
     tx: mpsc::Sender<BackgroundTask>,
     data: Option<RequestData>,
@@ -761,11 +759,17 @@ where
                 span_id: span_id.clone(),
             };
 
-            if let Err(e) = tx_for_request.try_send(BackgroundTask::Request {
-                data: request_data.clone(),
-            }) {
+            if tx_for_request.capacity() == 0 {
+                counter!("outlet_queue_backpressure_total", "kind" => "request").increment(1);
+            }
+            if let Err(e) = tx_for_request
+                .send(BackgroundTask::Request {
+                    data: request_data.clone(),
+                })
+                .await
+            {
                 counter!("outlet_queue_dropped_total").increment(1);
-                error!(correlation_id = %correlation_id, error = %e, "Dropped request data: channel full or closed");
+                error!(correlation_id = %correlation_id, error = %e, "Failed to deliver request data: channel closed");
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
             counter!("outlet_queue_enqueued_total").increment(1);
@@ -873,15 +877,19 @@ where
                             extensions: response_extensions,
                         };
 
+                        if tx_for_response.capacity() == 0 {
+                            counter!("outlet_queue_backpressure_total", "kind" => "response").increment(1);
+                        }
                         if tx_for_response
-                            .try_send(BackgroundTask::Response {
+                            .send(BackgroundTask::Response {
                                 request_data,
                                 response_data,
                             })
+                            .await
                             .is_err()
                         {
                             counter!("outlet_queue_dropped_total").increment(1);
-                            error!(correlation_id = %correlation_id, "Dropped response data: channel full or closed");
+                            error!(correlation_id = %correlation_id, "Failed to deliver response data: channel closed");
                         } else {
                             counter!("outlet_queue_enqueued_total").increment(1);
                         }
