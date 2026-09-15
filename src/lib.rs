@@ -168,14 +168,14 @@ async fn send_background_task(
     tx: &mpsc::Sender<BackgroundTask>,
     task: BackgroundTask,
     kind: &'static str,
-) -> Result<(), mpsc::error::SendError<BackgroundTask>> {
+) -> Result<(), Box<mpsc::error::SendError<BackgroundTask>>> {
     match tx.try_send(task) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(task)) => {
             counter!("outlet_queue_backpressure_total", "kind" => kind).increment(1);
-            tx.send(task).await
+            tx.send(task).await.map_err(Box::new)
         }
-        Err(mpsc::error::TrySendError::Closed(task)) => Err(mpsc::error::SendError(task)),
+        Err(mpsc::error::TrySendError::Closed(task)) => Err(Box::new(mpsc::error::SendError(task))),
     }
 }
 
@@ -842,7 +842,7 @@ where
                 {
                     counter!("outlet_queue_dropped_total").increment(1);
                     error!(correlation_id = %correlation_id, error = %e, "Failed to deliver request data: channel closed");
-                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                    return Err(e as Box<dyn std::error::Error + Send + Sync>);
                 }
                 counter!("outlet_queue_enqueued_total").increment(1);
 
