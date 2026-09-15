@@ -108,7 +108,7 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -160,6 +160,25 @@ fn convert_headers(headers: &axum::http::HeaderMap) -> HashMap<String, Vec<bytes
     result
 }
 
+/// Deliver a normal capture without losing it when the bounded queue is full.
+/// `try_send` makes the backpressure metric describe an actual failed
+/// reservation rather than a racy capacity snapshot; the recovered task is
+/// then sent asynchronously once capacity becomes available.
+async fn send_background_task(
+    tx: &mpsc::Sender<BackgroundTask>,
+    task: BackgroundTask,
+    kind: &'static str,
+) -> Result<(), mpsc::error::SendError<BackgroundTask>> {
+    match tx.try_send(task) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(task)) => {
+            counter!("outlet_queue_backpressure_total", "kind" => kind).increment(1);
+            tx.send(task).await
+        }
+        Err(mpsc::error::TrySendError::Closed(task)) => Err(mpsc::error::SendError(task)),
+    }
+}
+
 /// Configuration for the request logging middleware.
 ///
 /// Controls what data is captured and how the middleware behaves.
@@ -189,8 +208,10 @@ pub struct RequestLoggerConfig {
     /// Optional path filter to skip body capture for requests that don't match
     pub path_filter: Option<PathFilter>,
     /// Capacity of the bounded channel between the middleware and the background
-    /// processing task. Completed request/response captures wait asynchronously
-    /// for capacity rather than being dropped. Default: 4096.
+    /// processing task, and the maximum number of admitted capture lifecycles.
+    /// Saturated requests wait before entering the inner service, while completed
+    /// request/response captures wait asynchronously for queue capacity rather
+    /// than being dropped. Default: 4096.
     pub channel_capacity: usize,
 }
 
@@ -481,6 +502,7 @@ pub trait RequestHandler: Send + Sync + 'static {
 pub struct RequestLoggerLayer {
     config: RequestLoggerConfig,
     tx: mpsc::Sender<BackgroundTask>,
+    capture_slots: Arc<Semaphore>,
 }
 
 impl RequestLoggerLayer {
@@ -518,6 +540,7 @@ impl RequestLoggerLayer {
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
         let (tx, mut rx) = mpsc::channel::<BackgroundTask>(config.channel_capacity);
+        let capture_slots = Arc::new(Semaphore::new(config.channel_capacity));
         let handler = Arc::new(handler);
         let handler_clone = handler.clone();
 
@@ -621,7 +644,11 @@ impl RequestLoggerLayer {
             }
         });
 
-        Self { config, tx }
+        Self {
+            config,
+            tx,
+            capture_slots,
+        }
     }
 }
 
@@ -633,6 +660,7 @@ impl<S> Layer<S> for RequestLoggerLayer {
             inner,
             config: self.config.clone(),
             tx: self.tx.clone(),
+            capture_slots: self.capture_slots.clone(),
         }
     }
 }
@@ -649,6 +677,7 @@ pub struct RequestLoggerService<S> {
     inner: S,
     config: RequestLoggerConfig,
     tx: mpsc::Sender<BackgroundTask>,
+    capture_slots: Arc<Semaphore>,
 }
 
 impl<S> Service<Request> for RequestLoggerService<S>
@@ -695,6 +724,7 @@ where
 
         let config = self.config.clone();
         let tx = self.tx.clone();
+        let capture_slots = self.capture_slots.clone();
 
         let method_clone = method.clone();
         let uri_clone = uri.clone();
@@ -735,48 +765,6 @@ where
             None
         };
 
-        let request_data_future = tokio::spawn(async move {
-            let body = if let Some(capture_future) = capture_future {
-                match capture_future.await {
-                    Ok(captured_body) => Some(captured_body),
-                    Err(e) => {
-                        error!(correlation_id = %correlation_id, error = %e, "Error capturing request body");
-                        return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-                    }
-                }
-            } else {
-                None
-            };
-
-            let request_data = RequestData {
-                correlation_id,
-                timestamp: start_time,
-                method: method_clone,
-                uri: uri_clone,
-                headers: convert_headers(&headers_clone),
-                body,
-                trace_id: trace_id.clone(),
-                span_id: span_id.clone(),
-            };
-
-            if tx_for_request.capacity() == 0 {
-                counter!("outlet_queue_backpressure_total", "kind" => "request").increment(1);
-            }
-            if let Err(e) = tx_for_request
-                .send(BackgroundTask::Request {
-                    data: request_data.clone(),
-                })
-                .await
-            {
-                counter!("outlet_queue_dropped_total").increment(1);
-                error!(correlation_id = %correlation_id, error = %e, "Failed to deliver request data: channel closed");
-                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-            }
-            counter!("outlet_queue_enqueued_total").increment(1);
-
-            Ok(request_data)
-        });
-
         let future = self.inner.call(request);
 
         // Drop guard for the "client cancelled before any response" path.
@@ -801,6 +789,66 @@ where
         let mut abandon_guard = AbandonGuard::new(self.tx.clone(), abandon_data);
 
         Box::pin(async move {
+            // Bound the entire capture lifecycle, including detached tasks
+            // waiting to enqueue a completed response. Without this admission
+            // permit, a stalled handler could create an unbounded number of
+            // waiters outside the bounded channel.
+            let capture_slot = match capture_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    counter!("outlet_capture_admission_backpressure_total").increment(1);
+                    capture_slots
+                        .acquire_owned()
+                        .await
+                        .expect("capture semaphore is never closed")
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    unreachable!("capture semaphore is never closed")
+                }
+            };
+
+            let request_data_future = tokio::spawn(async move {
+                let body = if let Some(capture_future) = capture_future {
+                    match capture_future.await {
+                        Ok(captured_body) => Some(captured_body),
+                        Err(e) => {
+                            error!(correlation_id = %correlation_id, error = %e, "Error capturing request body");
+                            return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let request_data = RequestData {
+                    correlation_id,
+                    timestamp: start_time,
+                    method: method_clone,
+                    uri: uri_clone,
+                    headers: convert_headers(&headers_clone),
+                    body,
+                    trace_id: trace_id.clone(),
+                    span_id: span_id.clone(),
+                };
+
+                if let Err(e) = send_background_task(
+                    &tx_for_request,
+                    BackgroundTask::Request {
+                        data: request_data.clone(),
+                    },
+                    "request",
+                )
+                .await
+                {
+                    counter!("outlet_queue_dropped_total").increment(1);
+                    error!(correlation_id = %correlation_id, error = %e, "Failed to deliver request data: channel closed");
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                }
+                counter!("outlet_queue_enqueued_total").increment(1);
+
+                Ok(request_data)
+            });
+
             trace!("Awaiting inner service response");
             let result = future.await;
             trace!("Inner service response received");
@@ -834,6 +882,10 @@ where
 
                     // The future that outlives the request/response lifecycle
                     tokio::spawn(async move {
+                        // Keep the admission permit until this lifecycle has
+                        // handed its final capture to the bounded queue.
+                        let _capture_slot = capture_slot;
+
                         // Await request data future completion first
                         let request_data = match request_data_future.await {
                             Ok(Ok(data)) => data,
@@ -877,16 +929,16 @@ where
                             extensions: response_extensions,
                         };
 
-                        if tx_for_response.capacity() == 0 {
-                            counter!("outlet_queue_backpressure_total", "kind" => "response").increment(1);
-                        }
-                        if tx_for_response
-                            .send(BackgroundTask::Response {
+                        if send_background_task(
+                            &tx_for_response,
+                            BackgroundTask::Response {
                                 request_data,
                                 response_data,
-                            })
-                            .await
-                            .is_err()
+                            },
+                            "response",
+                        )
+                        .await
+                        .is_err()
                         {
                             counter!("outlet_queue_dropped_total").increment(1);
                             error!(correlation_id = %correlation_id, "Failed to deliver response data: channel closed");

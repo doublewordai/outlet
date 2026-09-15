@@ -395,6 +395,98 @@ async fn test_multiple_concurrent_requests() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn full_queue_backpressures_admission_without_dropping_captures() {
+    use axum::extract::State;
+    use tokio::sync::{Notify, Semaphore};
+
+    #[derive(Clone)]
+    struct BlockingHandler {
+        gate: Arc<Semaphore>,
+        first_request_started: Arc<Notify>,
+        request_count: Arc<AtomicUsize>,
+        response_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BlockingHandler {
+        async fn handle_request(&self, _data: RequestData) {
+            let request_number = self.request_count.fetch_add(1, Ordering::SeqCst);
+            if request_number == 0 {
+                self.first_request_started.notify_one();
+                let _permit = self.gate.acquire().await.unwrap();
+            }
+        }
+
+        async fn handle_response(&self, _request_data: RequestData, _response_data: ResponseData) {
+            self.response_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn counted_handler(State(calls): State<Arc<AtomicUsize>>) -> &'static str {
+        calls.fetch_add(1, Ordering::SeqCst);
+        "ok"
+    }
+
+    let gate = Arc::new(Semaphore::new(0));
+    let first_request_started = Arc::new(Notify::new());
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let response_count = Arc::new(AtomicUsize::new(0));
+    let inner_calls = Arc::new(AtomicUsize::new(0));
+    let handler = BlockingHandler {
+        gate: gate.clone(),
+        first_request_started: first_request_started.clone(),
+        request_count: request_count.clone(),
+        response_count: response_count.clone(),
+    };
+    let config = RequestLoggerConfig {
+        capture_request_body: false,
+        capture_response_body: true,
+        path_filter: None,
+        channel_capacity: 1,
+    };
+    let app = Router::new()
+        .route("/counted", get(counted_handler))
+        .with_state(inner_calls.clone())
+        .layer(RequestLoggerLayer::new(config, handler));
+    let server = Arc::new(axum_test::TestServer::new(app).unwrap());
+
+    let first = server.get("/counted").await;
+    assert_eq!(first.text(), "ok");
+    tokio::time::timeout(Duration::from_secs(1), first_request_started.notified())
+        .await
+        .expect("the blocked request handler should start");
+
+    // The first response capture now occupies the only queue slot. A second
+    // request can use the newly released lifecycle slot and still return its
+    // response while its capture waits for the queue.
+    let second = server.get("/counted").await;
+    assert_eq!(second.text(), "ok");
+
+    // The second lifecycle holds the sole admission slot, so a third request
+    // cannot create another detached waiter until the handler catches up.
+    let third_server = server.clone();
+    let third = tokio::spawn(async move { third_server.get("/counted").await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(inner_calls.load(Ordering::SeqCst), 2);
+    assert!(!third.is_finished());
+
+    gate.add_permits(1);
+    let third = tokio::time::timeout(Duration::from_secs(2), third)
+        .await
+        .expect("third request should be admitted after the queue drains")
+        .unwrap();
+    assert_eq!(third.text(), "ok");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while request_count.load(Ordering::SeqCst) < 3 || response_count.load(Ordering::SeqCst) < 3
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all request and response captures should be delivered");
+}
+
 #[tokio::test]
 async fn test_timing_accuracy() {
     let handler = TestHandler::new();
