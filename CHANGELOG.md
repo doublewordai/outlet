@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/doublewordai/outlet/compare/v0.10.0...v0.11.0) - 2026-09-16
+
+### Fixed
+
+- remove lossy request logging dispatcher ([#107](https://github.com/doublewordai/outlet/pull/107))
+
+### Other
+
+- release v0.10.0 ([#103](https://github.com/doublewordai/outlet/pull/103))
+
 ## [0.10.0](https://github.com/doublewordai/outlet/compare/v0.9.1...v0.10.0) - 2026-09-02
 
 ### Fixed
