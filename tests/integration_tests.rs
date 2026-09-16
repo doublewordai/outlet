@@ -395,6 +395,105 @@ async fn test_multiple_concurrent_requests() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_handler_does_not_block_request_admission_or_drop_captures() {
+    use axum::extract::State;
+    use tokio::sync::{Notify, Semaphore};
+
+    #[derive(Clone)]
+    struct BlockingHandler {
+        gate: Arc<Semaphore>,
+        first_request_started: Arc<Notify>,
+        request_count: Arc<AtomicUsize>,
+        response_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BlockingHandler {
+        async fn handle_request(&self, _data: RequestData) {
+            let request_number = self.request_count.fetch_add(1, Ordering::SeqCst);
+            if request_number == 0 {
+                self.first_request_started.notify_one();
+                let _permit = self.gate.acquire().await.unwrap();
+            }
+        }
+
+        async fn handle_response(&self, _request_data: RequestData, _response_data: ResponseData) {
+            self.response_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn counted_handler(State(calls): State<Arc<AtomicUsize>>) -> &'static str {
+        calls.fetch_add(1, Ordering::SeqCst);
+        "ok"
+    }
+
+    let gate = Arc::new(Semaphore::new(0));
+    let first_request_started = Arc::new(Notify::new());
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let response_count = Arc::new(AtomicUsize::new(0));
+    let inner_calls = Arc::new(AtomicUsize::new(0));
+    let handler = BlockingHandler {
+        gate: gate.clone(),
+        first_request_started: first_request_started.clone(),
+        request_count: request_count.clone(),
+        response_count: response_count.clone(),
+    };
+    let config = RequestLoggerConfig {
+        capture_request_body: false,
+        capture_response_body: true,
+        path_filter: None,
+        channel_capacity: 1,
+    };
+    let app = Router::new()
+        .route("/counted", get(counted_handler))
+        .with_state(inner_calls.clone())
+        .layer(RequestLoggerLayer::new(config, handler));
+    let server = Arc::new(axum_test::TestServer::new(app).unwrap());
+
+    let first = server.get("/counted").await;
+    assert_eq!(first.text(), "ok");
+    tokio::time::timeout(Duration::from_secs(1), first_request_started.notified())
+        .await
+        .expect("the blocked request handler should start");
+
+    // Even though one handler call is blocked, subsequent requests and their
+    // captures run independently. `channel_capacity` is retained only for
+    // source compatibility and no longer creates a lossy dispatch boundary.
+    let second = tokio::time::timeout(Duration::from_secs(1), server.get("/counted"))
+        .await
+        .expect("a slow handler must not delay the client response");
+    assert_eq!(second.text(), "ok");
+
+    let third = tokio::time::timeout(Duration::from_secs(1), server.get("/counted"))
+        .await
+        .expect("a slow handler must not apply request admission backpressure");
+    assert_eq!(third.text(), "ok");
+    assert_eq!(inner_calls.load(Ordering::SeqCst), 3);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while request_count.load(Ordering::SeqCst) < 3 || response_count.load(Ordering::SeqCst) < 2
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("later captures should be delivered while one request callback is slow");
+
+    // The first response callback waits for its matching request callback, so
+    // handlers can safely create per-request state before consuming a response.
+    assert_eq!(response_count.load(Ordering::SeqCst), 2);
+
+    gate.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while response_count.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retained response capture should be delivered after the request callback");
+}
+
 #[tokio::test]
 async fn test_timing_accuracy() {
     let handler = TestHandler::new();
@@ -663,6 +762,63 @@ async fn test_default_batch_impl_calls_individual_methods() {
     assert_eq!(response_count.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_middleware_preserves_batch_only_handlers() {
+    struct BatchOnlyHandler {
+        request_count: Arc<AtomicUsize>,
+        response_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BatchOnlyHandler {
+        async fn handle_request(&self, _data: RequestData) {
+            panic!("middleware should use the request batch hook");
+        }
+
+        async fn handle_response(&self, _req: RequestData, _res: ResponseData) {
+            panic!("middleware should use the response batch hook");
+        }
+
+        async fn handle_request_batch(&self, batch: &[RequestData]) {
+            assert_eq!(batch.len(), 1);
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn handle_response_batch(&self, batch: &[(RequestData, ResponseData)]) {
+            assert_eq!(batch.len(), 1);
+            self.response_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let response_count = Arc::new(AtomicUsize::new(0));
+    let handler = BatchOnlyHandler {
+        request_count: request_count.clone(),
+        response_count: response_count.clone(),
+    };
+    let app = Router::new()
+        .route("/hello", get(hello_handler))
+        .layer(RequestLoggerLayer::new(
+            RequestLoggerConfig {
+                capture_request_body: false,
+                capture_response_body: false,
+                ..Default::default()
+            },
+            handler,
+        ));
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    assert_eq!(server.get("/hello").await.status_code(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while request_count.load(Ordering::SeqCst) != 1
+            || response_count.load(Ordering::SeqCst) != 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both singleton batch hooks should be called");
+}
+
 // ---------------------------------------------------------------------------
 // Abandoned-request tests
 // ---------------------------------------------------------------------------
@@ -714,6 +870,67 @@ async fn test_abandoned_fires_when_outer_future_dropped_mid_request() {
     assert_eq!(abandoned[0].0.uri.path(), "/pending");
     // No response should have been captured for the abandoned request.
     assert!(handler.get_responses().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_uses_batch_hook() {
+    use tower::ServiceExt;
+
+    struct BatchOnlyAbandonedHandler {
+        abandoned_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BatchOnlyAbandonedHandler {
+        async fn handle_request(&self, _data: RequestData) {}
+
+        async fn handle_response(&self, _request_data: RequestData, _response_data: ResponseData) {}
+
+        async fn handle_abandoned(&self, _request_data: RequestData) {
+            panic!("middleware should use the abandoned batch hook");
+        }
+
+        async fn handle_abandoned_batch(&self, batch: &[RequestData]) {
+            assert_eq!(batch.len(), 1);
+            self.abandoned_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn pending_handler() -> impl IntoResponse {
+        std::future::pending::<()>().await;
+        "unreachable"
+    }
+
+    let abandoned_count = Arc::new(AtomicUsize::new(0));
+    let handler = BatchOnlyAbandonedHandler {
+        abandoned_count: abandoned_count.clone(),
+    };
+    let app: Router =
+        Router::new()
+            .route("/pending", get(pending_handler))
+            .layer(RequestLoggerLayer::new(
+                RequestLoggerConfig::default(),
+                handler,
+            ));
+
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/pending")
+        .body(Body::empty())
+        .unwrap();
+    let response_future = app.oneshot(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), response_future)
+            .await
+            .is_err()
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while abandoned_count.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the singleton abandoned batch hook should be called");
 }
 
 #[tokio::test(flavor = "multi_thread")]

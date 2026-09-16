@@ -96,10 +96,12 @@
 //! ```
 
 use axum::{body::Body, extract::Request, response::Response};
-use metrics::counter;
+use futures::FutureExt as _;
 use opentelemetry::trace::TraceContextExt;
 use std::{
     collections::HashMap,
+    future::Future,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -108,13 +110,11 @@ use std::{
     task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::sync::mpsc;
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub mod types;
-use types::BackgroundTask;
 pub use types::{RequestData, ResponseData};
 
 pub mod body_wrapper;
@@ -188,10 +188,14 @@ pub struct RequestLoggerConfig {
     pub capture_response_body: bool,
     /// Optional path filter to skip body capture for requests that don't match
     pub path_filter: Option<PathFilter>,
-    /// Capacity of the bounded channel between the middleware and the background
-    /// processing task. When the channel is full, new items are dropped (with a
-    /// counter increment on `outlet_queue_dropped_total`) rather than applying
-    /// backpressure to the request path. Default: 4096.
+    /// Retained for source compatibility. Handler dispatch no longer uses a
+    /// bounded channel, so this value has no effect.
+    ///
+    /// Each completed capture now owns its handler future. This deliberately
+    /// favors delivery over dropping captures or applying request-admission
+    /// backpressure: if a handler remains stalled, completed capture tasks and
+    /// their data can accumulate until the handler recovers or the process is
+    /// restarted.
     pub channel_capacity: usize,
 }
 
@@ -272,58 +276,6 @@ impl PathFilter {
 ///     }
 /// }
 /// ```
-/// Drop-fired sentinel that `try_send`s a [`BackgroundTask::Abandoned`] if
-/// not [`disarm`](Self::disarm)ed first.
-///
-/// Used by [`RequestLoggerService::call`] to detect the "client cancelled
-/// before any response was produced" path: the outer future is dropped
-/// before reaching the `Ok(response)` arm, so the detached response task
-/// is never spawned and `BackgroundTask::Response` never fires. The guard
-/// catches that drop and feeds an `Abandoned` event into the same
-/// background channel.
-///
-/// The send is best-effort (`try_send`) because Drop runs synchronously
-/// and can't await; if the channel is full or closed, the abandon event is
-/// dropped along with the `outlet_queue_dropped_total` counter, same as
-/// other tasks under back-pressure.
-struct AbandonGuard {
-    tx: mpsc::Sender<BackgroundTask>,
-    data: Option<RequestData>,
-}
-
-impl AbandonGuard {
-    fn new(tx: mpsc::Sender<BackgroundTask>, data: RequestData) -> Self {
-        Self {
-            tx,
-            data: Some(data),
-        }
-    }
-
-    /// Consume the held request data so the guard's Drop becomes a no-op.
-    /// Called once the inner future yields a value — at that point the
-    /// outer flow has either spawned the response task (Ok) or returned
-    /// an error (Err), and neither case is abandonment.
-    fn disarm(&mut self) {
-        self.data.take();
-    }
-}
-
-impl Drop for AbandonGuard {
-    fn drop(&mut self) {
-        if let Some(data) = self.data.take() {
-            if self
-                .tx
-                .try_send(BackgroundTask::Abandoned { data })
-                .is_err()
-            {
-                counter!("outlet_queue_dropped_total").increment(1);
-            } else {
-                counter!("outlet_queue_enqueued_total").increment(1);
-            }
-        }
-    }
-}
-
 pub trait RequestHandler: Send + Sync + 'static {
     /// Handle a captured HTTP request.
     ///
@@ -357,8 +309,8 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// upstream call was still in flight. The `request_data` carries
     /// whatever was captured synchronously at request time; the request
     /// body is always `None` because body capture is decoupled (it lives
-    /// on a separate spawned task) and racing it would slow down the
-    /// abandon path's `try_send`.
+    /// on a separate spawned task) and awaiting it would delay cancellation
+    /// cleanup.
     ///
     /// Default implementation is a no-op so adding this trait method is not
     /// a breaking change. Override it if you maintain per-request state
@@ -391,12 +343,14 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of captured HTTP requests.
     ///
-    /// Called by the background task with all requests that have accumulated since
-    /// the last flush. The default implementation clones each item and calls
+    /// Called by the middleware for captured requests. Without an intermediate
+    /// dispatcher, the middleware supplies a singleton batch for each completed
+    /// capture. The default implementation clones each item and calls
     /// [`handle_request`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT)
-    /// that can borrow directly from the slice without cloning.
+    /// The batch hook remains the dispatch contract for handlers that override
+    /// it, although direct dispatch means Outlet itself no longer combines
+    /// multiple captures into one call.
     fn handle_request_batch(
         &self,
         batch: &[RequestData],
@@ -412,12 +366,14 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of captured HTTP responses.
     ///
-    /// Called by the background task with all responses that have accumulated since
-    /// the last flush. The default implementation clones each item and calls
+    /// Called by the middleware for captured responses. Without an intermediate
+    /// dispatcher, the middleware supplies a singleton batch for each completed
+    /// capture. The default implementation clones each item and calls
     /// [`handle_response`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT)
-    /// that can borrow directly from the slice without cloning.
+    /// The batch hook remains the dispatch contract for handlers that override
+    /// it, although direct dispatch means Outlet itself no longer combines
+    /// multiple captures into one call.
     fn handle_response_batch(
         &self,
         batch: &[(RequestData, ResponseData)],
@@ -433,8 +389,9 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of abandoned requests.
     ///
-    /// Default implementation calls [`handle_abandoned`] for each item
-    /// concurrently. Override for bulk operations.
+    /// Direct dispatch supplies a singleton batch for each abandonment. The
+    /// default implementation calls [`handle_abandoned`] for each item
+    /// concurrently.
     fn handle_abandoned_batch(
         &self,
         batch: &[RequestData],
@@ -449,13 +406,108 @@ pub trait RequestHandler: Send + Sync + 'static {
     }
 }
 
+type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+async fn run_handler<F>(operation: &'static str, span: tracing::Span, future: F)
+where
+    F: Future<Output = ()> + Send,
+{
+    if AssertUnwindSafe(future)
+        .catch_unwind()
+        .instrument(span)
+        .await
+        .is_err()
+    {
+        error!(operation, "Outlet handler panicked");
+    }
+}
+
+/// Object-safe adapter used by the non-generic middleware layer.
+trait DynRequestHandler: Send + Sync {
+    fn handle_request_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a>;
+    fn handle_response_batch<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> HandlerFuture<'a>;
+    fn handle_abandoned_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a>;
+}
+
+struct RequestHandlerAdapter<H>(H);
+
+impl<H: RequestHandler> DynRequestHandler for RequestHandlerAdapter<H> {
+    fn handle_request_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_request_batch(batch))
+    }
+
+    fn handle_response_batch<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_response_batch(batch))
+    }
+
+    fn handle_abandoned_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_abandoned_batch(batch))
+    }
+}
+
+/// Detects a request future that is dropped before producing a response.
+/// The handler still runs in its own task, so cancellation observation does
+/// not depend on capacity in an intermediate queue.
+struct AbandonGuard {
+    handler: Arc<dyn DynRequestHandler>,
+    data: Option<RequestData>,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl AbandonGuard {
+    fn new(handler: Arc<dyn DynRequestHandler>, data: RequestData) -> Self {
+        Self {
+            handler,
+            data: Some(data),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.data.take();
+    }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            let handler = self.handler.clone();
+            let runtime = self
+                .runtime
+                .clone()
+                .or_else(|| tokio::runtime::Handle::try_current().ok());
+            let Some(runtime) = runtime else {
+                error!("Unable to dispatch abandoned request outside a Tokio runtime");
+                return;
+            };
+            runtime.spawn(async move {
+                let batch = [data];
+                run_handler(
+                    "abandoned_batch",
+                    tracing::info_span!("outlet.handle_abandoned_batch", batch_size = 1),
+                    async move {
+                        handler.handle_abandoned_batch(&batch).await;
+                    },
+                )
+                .await;
+            });
+        }
+    }
+}
+
 /// Tower layer for the request logging middleware.
 ///
 /// This is the main entry point for using the outlet middleware. It implements the Tower
 /// [`Layer`] trait and can be used with Axum's layering system.
 ///
-/// The layer spawns a background task to process captured request/response data using
-/// the provided [`RequestHandler`].
+/// The layer processes each completed capture with the provided
+/// [`RequestHandler`] in a detached per-capture task.
 ///
 /// # Examples
 ///
@@ -482,14 +534,16 @@ pub trait RequestHandler: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct RequestLoggerLayer {
     config: RequestLoggerConfig,
-    tx: mpsc::Sender<BackgroundTask>,
+    handler: Arc<dyn DynRequestHandler>,
 }
 
 impl RequestLoggerLayer {
     /// Create a new request logger layer with the given configuration and handler.
     ///
-    /// This spawns a background task that will process captured request/response data
-    /// using the provided handler.
+    /// Captured request/response data is passed to the handler from the existing
+    /// detached capture tasks, without an intermediate dispatch queue. A stalled
+    /// handler therefore retains completed capture tasks rather than dropping
+    /// their data or blocking admission of later requests.
     ///
     /// # Arguments
     ///
@@ -511,7 +565,7 @@ impl RequestLoggerLayer {
     /// };
     /// let handler = LoggingHandler;
     ///
-    /// // Spawns the background task that runs the provided handler
+    /// // Captures are passed to the handler from detached per-capture tasks
     /// let layer = RequestLoggerLayer::new(config, handler);
     ///
     /// // use the layer anywhere you'd use a tower layer, and your handler will be called (in the
@@ -519,111 +573,10 @@ impl RequestLoggerLayer {
     /// # }
     /// ```
     pub fn new<H: RequestHandler>(config: RequestLoggerConfig, handler: H) -> Self {
-        let (tx, mut rx) = mpsc::channel::<BackgroundTask>(config.channel_capacity);
-        let handler = Arc::new(handler);
-        let handler_clone = handler.clone();
-
-        // Spawn the background task using write-through batching.
-        // Waits for at least one item, drains all available items, then flushes
-        // the batch to the handler. This gives low latency at low load (single
-        // item → immediate flush) and batching efficiency at high load.
-        tokio::spawn(async move {
-            loop {
-                // Block until at least one item arrives (or channel closes)
-                let first = match rx.recv().await {
-                    Some(task) => task,
-                    None => break, // channel closed, shut down
-                };
-
-                // Non-blocking drain of all queued items
-                let mut tasks = vec![first];
-                while let Ok(task) = rx.try_recv() {
-                    tasks.push(task);
-                }
-
-                counter!("outlet_queue_dequeued_total").increment(tasks.len() as u64);
-
-                // Separate into request, response, and abandoned batches
-                let mut request_batch = Vec::new();
-                let mut response_batch = Vec::new();
-                let mut abandoned_batch = Vec::new();
-
-                for task in tasks {
-                    match task {
-                        BackgroundTask::Request { data } => {
-                            request_batch.push(data);
-                        }
-                        BackgroundTask::Response {
-                            request_data,
-                            response_data,
-                            ..
-                        } => {
-                            response_batch.push((request_data, response_data));
-                        }
-                        BackgroundTask::Abandoned { data } => {
-                            abandoned_batch.push(data);
-                        }
-                    }
-                }
-
-                // Dispatch batches concurrently. Each batch is spawned as a
-                // task so a panic in one handler doesn't kill the loop.
-                let handler = handler_clone.clone();
-                let req_handle = if !request_batch.is_empty() {
-                    let h = handler.clone();
-                    Some(tokio::spawn(async move {
-                        h.handle_request_batch(&request_batch).await;
-                    }))
-                } else {
-                    None
-                };
-                let res_handle = if !response_batch.is_empty() {
-                    let h = handler.clone();
-                    Some(tokio::spawn(async move {
-                        let span = tracing::info_span!(
-                            "outlet.handle_response_batch",
-                            batch_size = response_batch.len(),
-                        );
-                        h.handle_response_batch(&response_batch)
-                            .instrument(span)
-                            .await;
-                    }))
-                } else {
-                    None
-                };
-                let abandoned_handle = if !abandoned_batch.is_empty() {
-                    let h = handler.clone();
-                    Some(tokio::spawn(async move {
-                        let span = tracing::info_span!(
-                            "outlet.handle_abandoned_batch",
-                            batch_size = abandoned_batch.len(),
-                        );
-                        h.handle_abandoned_batch(&abandoned_batch)
-                            .instrument(span)
-                            .await;
-                    }))
-                } else {
-                    None
-                };
-                if let Some(handle) = req_handle {
-                    if let Err(e) = handle.await {
-                        error!("Request batch handler panicked: {}", e);
-                    }
-                }
-                if let Some(handle) = res_handle {
-                    if let Err(e) = handle.await {
-                        error!("Response batch handler panicked: {}", e);
-                    }
-                }
-                if let Some(handle) = abandoned_handle {
-                    if let Err(e) = handle.await {
-                        error!("Abandoned batch handler panicked: {}", e);
-                    }
-                }
-            }
-        });
-
-        Self { config, tx }
+        Self {
+            config,
+            handler: Arc::new(RequestHandlerAdapter(handler)),
+        }
     }
 }
 
@@ -634,7 +587,7 @@ impl<S> Layer<S> for RequestLoggerLayer {
         RequestLoggerService {
             inner,
             config: self.config.clone(),
-            tx: self.tx.clone(),
+            handler: self.handler.clone(),
         }
     }
 }
@@ -650,7 +603,7 @@ impl<S> Layer<S> for RequestLoggerLayer {
 pub struct RequestLoggerService<S> {
     inner: S,
     config: RequestLoggerConfig,
-    tx: mpsc::Sender<BackgroundTask>,
+    handler: Arc<dyn DynRequestHandler>,
 }
 
 impl<S> Service<Request> for RequestLoggerService<S>
@@ -696,13 +649,13 @@ where
         let headers = request.headers().clone();
 
         let config = self.config.clone();
-        let tx = self.tx.clone();
+        let handler = self.handler.clone();
 
         let method_clone = method.clone();
         let uri_clone = uri.clone();
         let headers_clone = headers.clone();
-        let tx_for_request = tx.clone();
-        let tx_for_response = tx.clone();
+        let handler_for_request = handler.clone();
+        let handler_for_response = handler.clone();
 
         // Capture trace_id and span_id from current span for RequestData
         let (trace_id, span_id) = {
@@ -761,14 +714,16 @@ where
                 span_id: span_id.clone(),
             };
 
-            if let Err(e) = tx_for_request.try_send(BackgroundTask::Request {
-                data: request_data.clone(),
-            }) {
-                counter!("outlet_queue_dropped_total").increment(1);
-                error!(correlation_id = %correlation_id, error = %e, "Dropped request data: channel full or closed");
-                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
-            }
-            counter!("outlet_queue_enqueued_total").increment(1);
+            let handler_data = request_data.clone();
+            let batch = [handler_data];
+            run_handler(
+                "request_batch",
+                tracing::info_span!("outlet.handle_request_batch", batch_size = 1),
+                async move {
+                    handler_for_request.handle_request_batch(&batch).await;
+                },
+            )
+            .await;
 
             Ok(request_data)
         });
@@ -776,14 +731,8 @@ where
         let future = self.inner.call(request);
 
         // Drop guard for the "client cancelled before any response" path.
-        // If the outer future is dropped between here and the `Ok(response)`
-        // arm (which spawns a detached task that owns continuation), the
-        // guard's Drop synchronously try_sends a `BackgroundTask::Abandoned`
-        // so handlers can clean up per-request state. We build a minimal
-        // RequestData with no body — the real body capture races the inner
-        // drop and isn't guaranteed to land — and feed it to the guard.
-        // After we reach `Ok(response)`, the guard is disarmed so normal
-        // completion doesn't double-fire alongside `BackgroundTask::Response`.
+        // The guard starts the abandoned handler directly in a detached task;
+        // there is no intermediate queue that can reject the event.
         let abandon_data = RequestData {
             correlation_id,
             timestamp: start_time,
@@ -794,7 +743,7 @@ where
             trace_id: trace_id_for_abandon,
             span_id: span_id_for_abandon,
         };
-        let mut abandon_guard = AbandonGuard::new(self.tx.clone(), abandon_data);
+        let mut abandon_guard = AbandonGuard::new(handler, abandon_data);
 
         Box::pin(async move {
             trace!("Awaiting inner service response");
@@ -830,8 +779,45 @@ where
 
                     // The future that outlives the request/response lifecycle
                     tokio::spawn(async move {
-                        // Await request data future completion first
-                        let request_data = match request_data_future.await {
+                        // Drain the response capture while the matching request
+                        // callback runs. The response callback still waits for
+                        // both, preserving request-before-response ordering
+                        // without leaving streamed chunks queued in memory.
+                        let response_data_future = async move {
+                            let (body, total_duration) = if let Some(capture_future) = capture_future {
+                                match capture_future.await {
+                                    Ok(captured_body) => {
+                                        let stream_completion_time = SystemTime::now();
+                                        let total_duration = stream_completion_time
+                                            .duration_since(start_time)
+                                            .unwrap_or_default();
+                                        (Some(captured_body), total_duration)
+                                    }
+                                    Err(e) => {
+                                        error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
+                                        (None, duration_to_first_byte)
+                                    }
+                                }
+                            } else {
+                                // No streaming - total duration equals first byte duration
+                                (None, duration_to_first_byte)
+                            };
+
+                            ResponseData {
+                                correlation_id,
+                                timestamp: first_byte_time,
+                                status: response_status,
+                                headers: convert_headers(&response_headers),
+                                body,
+                                duration_to_first_byte,
+                                duration: total_duration,
+                                extensions: response_extensions,
+                            }
+                        };
+
+                        let (request_data_result, response_data) =
+                            tokio::join!(request_data_future, response_data_future);
+                        let request_data = match request_data_result {
                             Ok(Ok(data)) => data,
                             Ok(Err(e)) => {
                                 error!(correlation_id = %correlation_id, error = %e, "Error processing request data");
@@ -843,48 +829,15 @@ where
                             }
                         };
 
-                        let (body, total_duration) = if let Some(capture_future) = capture_future {
-                            match capture_future.await {
-                                Ok(captured_body) => {
-                                    let stream_completion_time = SystemTime::now();
-                                    let total_duration = stream_completion_time
-                                        .duration_since(start_time)
-                                        .unwrap_or_default();
-                                    (Some(captured_body), total_duration)
-                                }
-                                Err(e) => {
-                                    error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
-                                    (None, duration_to_first_byte)
-                                }
-                            }
-                        } else {
-                            // No streaming - total duration equals first byte duration
-                            (None, duration_to_first_byte)
-                        };
-
-                        let response_data = ResponseData {
-                            correlation_id,
-                            timestamp: first_byte_time,
-                            status: response_status,
-                            headers: convert_headers(&response_headers),
-                            body,
-                            duration_to_first_byte,
-                            duration: total_duration,
-                            extensions: response_extensions,
-                        };
-
-                        if tx_for_response
-                            .try_send(BackgroundTask::Response {
-                                request_data,
-                                response_data,
-                            })
-                            .is_err()
-                        {
-                            counter!("outlet_queue_dropped_total").increment(1);
-                            error!(correlation_id = %correlation_id, "Dropped response data: channel full or closed");
-                        } else {
-                            counter!("outlet_queue_enqueued_total").increment(1);
-                        }
+                        let batch = [(request_data, response_data)];
+                        run_handler(
+                            "response_batch",
+                            tracing::info_span!("outlet.handle_response_batch", batch_size = 1),
+                            async move {
+                                handler_for_response.handle_response_batch(&batch).await;
+                            },
+                        )
+                        .await;
                     });
 
                     Ok(response)
