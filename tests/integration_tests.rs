@@ -873,6 +873,67 @@ async fn test_abandoned_fires_when_outer_future_dropped_mid_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_abandoned_uses_batch_hook() {
+    use tower::ServiceExt;
+
+    struct BatchOnlyAbandonedHandler {
+        abandoned_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BatchOnlyAbandonedHandler {
+        async fn handle_request(&self, _data: RequestData) {}
+
+        async fn handle_response(&self, _request_data: RequestData, _response_data: ResponseData) {}
+
+        async fn handle_abandoned(&self, _request_data: RequestData) {
+            panic!("middleware should use the abandoned batch hook");
+        }
+
+        async fn handle_abandoned_batch(&self, batch: &[RequestData]) {
+            assert_eq!(batch.len(), 1);
+            self.abandoned_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn pending_handler() -> impl IntoResponse {
+        std::future::pending::<()>().await;
+        "unreachable"
+    }
+
+    let abandoned_count = Arc::new(AtomicUsize::new(0));
+    let handler = BatchOnlyAbandonedHandler {
+        abandoned_count: abandoned_count.clone(),
+    };
+    let app: Router =
+        Router::new()
+            .route("/pending", get(pending_handler))
+            .layer(RequestLoggerLayer::new(
+                RequestLoggerConfig::default(),
+                handler,
+            ));
+
+    let request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri("/pending")
+        .body(Body::empty())
+        .unwrap();
+    let response_future = app.oneshot(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), response_future)
+            .await
+            .is_err()
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while abandoned_count.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the singleton abandoned batch hook should be called");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_abandoned_does_not_fire_when_inner_service_returns_err() {
     use tower::{Layer, Service, ServiceExt};
 

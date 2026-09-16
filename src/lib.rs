@@ -769,8 +769,45 @@ where
 
                     // The future that outlives the request/response lifecycle
                     tokio::spawn(async move {
-                        // Await request data future completion first
-                        let request_data = match request_data_future.await {
+                        // Drain the response capture while the matching request
+                        // callback runs. The response callback still waits for
+                        // both, preserving request-before-response ordering
+                        // without leaving streamed chunks queued in memory.
+                        let response_data_future = async move {
+                            let (body, total_duration) = if let Some(capture_future) = capture_future {
+                                match capture_future.await {
+                                    Ok(captured_body) => {
+                                        let stream_completion_time = SystemTime::now();
+                                        let total_duration = stream_completion_time
+                                            .duration_since(start_time)
+                                            .unwrap_or_default();
+                                        (Some(captured_body), total_duration)
+                                    }
+                                    Err(e) => {
+                                        error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
+                                        (None, duration_to_first_byte)
+                                    }
+                                }
+                            } else {
+                                // No streaming - total duration equals first byte duration
+                                (None, duration_to_first_byte)
+                            };
+
+                            ResponseData {
+                                correlation_id,
+                                timestamp: first_byte_time,
+                                status: response_status,
+                                headers: convert_headers(&response_headers),
+                                body,
+                                duration_to_first_byte,
+                                duration: total_duration,
+                                extensions: response_extensions,
+                            }
+                        };
+
+                        let (request_data_result, response_data) =
+                            tokio::join!(request_data_future, response_data_future);
+                        let request_data = match request_data_result {
                             Ok(Ok(data)) => data,
                             Ok(Err(e)) => {
                                 error!(correlation_id = %correlation_id, error = %e, "Error processing request data");
@@ -780,36 +817,6 @@ where
                                 error!(correlation_id = %correlation_id, error = %e, "Error retrieving request data");
                                 return; // Early return if we can't get request data
                             }
-                        };
-
-                        let (body, total_duration) = if let Some(capture_future) = capture_future {
-                            match capture_future.await {
-                                Ok(captured_body) => {
-                                    let stream_completion_time = SystemTime::now();
-                                    let total_duration = stream_completion_time
-                                        .duration_since(start_time)
-                                        .unwrap_or_default();
-                                    (Some(captured_body), total_duration)
-                                }
-                                Err(e) => {
-                                    error!(correlation_id = %correlation_id, error = %e, "Error capturing response body");
-                                    (None, duration_to_first_byte)
-                                }
-                            }
-                        } else {
-                            // No streaming - total duration equals first byte duration
-                            (None, duration_to_first_byte)
-                        };
-
-                        let response_data = ResponseData {
-                            correlation_id,
-                            timestamp: first_byte_time,
-                            status: response_status,
-                            headers: convert_headers(&response_headers),
-                            body,
-                            duration_to_first_byte,
-                            duration: total_duration,
-                            extensions: response_extensions,
                         };
 
                         let batch = [(request_data, response_data)];
