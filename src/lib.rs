@@ -96,10 +96,12 @@
 //! ```
 
 use axum::{body::Body, extract::Request, response::Response};
+use futures::FutureExt as _;
 use opentelemetry::trace::TraceContextExt;
 use std::{
     collections::HashMap,
     future::Future,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -307,8 +309,8 @@ pub trait RequestHandler: Send + Sync + 'static {
     /// upstream call was still in flight. The `request_data` carries
     /// whatever was captured synchronously at request time; the request
     /// body is always `None` because body capture is decoupled (it lives
-    /// on a separate spawned task) and racing it would slow down the
-    /// abandon path's `try_send`.
+    /// on a separate spawned task) and awaiting it would delay cancellation
+    /// cleanup.
     ///
     /// Default implementation is a no-op so adding this trait method is not
     /// a breaking change. Override it if you maintain per-request state
@@ -406,6 +408,20 @@ pub trait RequestHandler: Send + Sync + 'static {
 
 type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+async fn run_handler<F>(operation: &'static str, span: tracing::Span, future: F)
+where
+    F: Future<Output = ()> + Send,
+{
+    if AssertUnwindSafe(future)
+        .catch_unwind()
+        .instrument(span)
+        .await
+        .is_err()
+    {
+        error!(operation, "Outlet handler panicked");
+    }
+}
+
 /// Object-safe adapter used by the non-generic middleware layer.
 trait DynRequestHandler: Send + Sync {
     fn handle_request_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a>;
@@ -461,7 +477,13 @@ impl Drop for AbandonGuard {
         if let Some(data) = self.data.take() {
             let handler = self.handler.clone();
             tokio::spawn(async move {
-                handler.handle_abandoned_batch(&[data]).await;
+                let batch = [data];
+                run_handler(
+                    "abandoned_batch",
+                    tracing::info_span!("outlet.handle_abandoned_batch", batch_size = 1),
+                    handler.handle_abandoned_batch(&batch),
+                )
+                .await;
             });
         }
     }
@@ -472,8 +494,8 @@ impl Drop for AbandonGuard {
 /// This is the main entry point for using the outlet middleware. It implements the Tower
 /// [`Layer`] trait and can be used with Axum's layering system.
 ///
-/// The layer spawns a background task to process captured request/response data using
-/// the provided [`RequestHandler`].
+/// The layer processes each completed capture with the provided
+/// [`RequestHandler`] in a detached per-capture task.
 ///
 /// # Examples
 ///
@@ -531,7 +553,7 @@ impl RequestLoggerLayer {
     /// };
     /// let handler = LoggingHandler;
     ///
-    /// // Spawns the background task that runs the provided handler
+    /// // Captures are passed to the handler from detached per-capture tasks
     /// let layer = RequestLoggerLayer::new(config, handler);
     ///
     /// // use the layer anywhere you'd use a tower layer, and your handler will be called (in the
@@ -682,9 +704,13 @@ where
 
             let handler_data = request_data.clone();
             tokio::spawn(async move {
-                handler_for_request
-                    .handle_request_batch(&[handler_data])
-                    .await;
+                let batch = [handler_data];
+                run_handler(
+                    "request_batch",
+                    tracing::info_span!("outlet.handle_request_batch", batch_size = 1),
+                    handler_for_request.handle_request_batch(&batch),
+                )
+                .await;
             });
 
             Ok(request_data)
@@ -784,9 +810,13 @@ where
                             extensions: response_extensions,
                         };
 
-                        handler_for_response
-                            .handle_response_batch(&[(request_data, response_data)])
-                            .await;
+                        let batch = [(request_data, response_data)];
+                        run_handler(
+                            "response_batch",
+                            tracing::info_span!("outlet.handle_response_batch", batch_size = 1),
+                            handler_for_response.handle_response_batch(&batch),
+                        )
+                        .await;
                     });
 
                     Ok(response)
