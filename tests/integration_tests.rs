@@ -471,15 +471,27 @@ async fn slow_handler_does_not_block_request_admission_or_drop_captures() {
     assert_eq!(inner_calls.load(Ordering::SeqCst), 3);
 
     tokio::time::timeout(Duration::from_secs(2), async {
-        while request_count.load(Ordering::SeqCst) < 3 || response_count.load(Ordering::SeqCst) < 3
+        while request_count.load(Ordering::SeqCst) < 3 || response_count.load(Ordering::SeqCst) < 2
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("all request and response captures should be delivered while one handler call is slow");
+    .expect("later captures should be delivered while one request callback is slow");
+
+    // The first response callback waits for its matching request callback, so
+    // handlers can safely create per-request state before consuming a response.
+    assert_eq!(response_count.load(Ordering::SeqCst), 2);
 
     gate.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while response_count.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retained response capture should be delivered after the request callback");
 }
 
 #[tokio::test]

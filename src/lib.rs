@@ -481,7 +481,9 @@ impl Drop for AbandonGuard {
                 run_handler(
                     "abandoned_batch",
                     tracing::info_span!("outlet.handle_abandoned_batch", batch_size = 1),
-                    handler.handle_abandoned_batch(&batch),
+                    async move {
+                        handler.handle_abandoned_batch(&batch).await;
+                    },
                 )
                 .await;
             });
@@ -703,15 +705,15 @@ where
             };
 
             let handler_data = request_data.clone();
-            tokio::spawn(async move {
-                let batch = [handler_data];
-                run_handler(
-                    "request_batch",
-                    tracing::info_span!("outlet.handle_request_batch", batch_size = 1),
-                    handler_for_request.handle_request_batch(&batch),
-                )
-                .await;
-            });
+            let batch = [handler_data];
+            run_handler(
+                "request_batch",
+                tracing::info_span!("outlet.handle_request_batch", batch_size = 1),
+                async move {
+                    handler_for_request.handle_request_batch(&batch).await;
+                },
+            )
+            .await;
 
             Ok(request_data)
         });
@@ -814,7 +816,9 @@ where
                         run_handler(
                             "response_batch",
                             tracing::info_span!("outlet.handle_response_batch", batch_size = 1),
-                            handler_for_response.handle_response_batch(&batch),
+                            async move {
+                                handler_for_response.handle_response_batch(&batch).await;
+                            },
                         )
                         .await;
                     });
