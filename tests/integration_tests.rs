@@ -750,6 +750,63 @@ async fn test_default_batch_impl_calls_individual_methods() {
     assert_eq!(response_count.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn test_middleware_preserves_batch_only_handlers() {
+    struct BatchOnlyHandler {
+        request_count: Arc<AtomicUsize>,
+        response_count: Arc<AtomicUsize>,
+    }
+
+    impl RequestHandler for BatchOnlyHandler {
+        async fn handle_request(&self, _data: RequestData) {
+            panic!("middleware should use the request batch hook");
+        }
+
+        async fn handle_response(&self, _req: RequestData, _res: ResponseData) {
+            panic!("middleware should use the response batch hook");
+        }
+
+        async fn handle_request_batch(&self, batch: &[RequestData]) {
+            assert_eq!(batch.len(), 1);
+            self.request_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn handle_response_batch(&self, batch: &[(RequestData, ResponseData)]) {
+            assert_eq!(batch.len(), 1);
+            self.response_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let response_count = Arc::new(AtomicUsize::new(0));
+    let handler = BatchOnlyHandler {
+        request_count: request_count.clone(),
+        response_count: response_count.clone(),
+    };
+    let app = Router::new()
+        .route("/hello", get(hello_handler))
+        .layer(RequestLoggerLayer::new(
+            RequestLoggerConfig {
+                capture_request_body: false,
+                capture_response_body: false,
+                ..Default::default()
+            },
+            handler,
+        ));
+    let server = axum_test::TestServer::new(app).unwrap();
+
+    assert_eq!(server.get("/hello").await.status_code(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while request_count.load(Ordering::SeqCst) != 1
+            || response_count.load(Ordering::SeqCst) != 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both singleton batch hooks should be called");
+}
+
 // ---------------------------------------------------------------------------
 // Abandoned-request tests
 // ---------------------------------------------------------------------------

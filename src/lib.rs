@@ -188,6 +188,12 @@ pub struct RequestLoggerConfig {
     pub path_filter: Option<PathFilter>,
     /// Retained for source compatibility. Handler dispatch no longer uses a
     /// bounded channel, so this value has no effect.
+    ///
+    /// Each completed capture now owns its handler future. This deliberately
+    /// favors delivery over dropping captures or applying request-admission
+    /// backpressure: if a handler remains stalled, completed capture tasks and
+    /// their data can accumulate until the handler recovers or the process is
+    /// restarted.
     pub channel_capacity: usize,
 }
 
@@ -335,12 +341,14 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of captured HTTP requests.
     ///
-    /// Called by the background task with all requests that have accumulated since
-    /// the last flush. The default implementation clones each item and calls
+    /// Called by the middleware for captured requests. Without an intermediate
+    /// dispatcher, the middleware supplies a singleton batch for each completed
+    /// capture. The default implementation clones each item and calls
     /// [`handle_request`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT)
-    /// that can borrow directly from the slice without cloning.
+    /// The batch hook remains the dispatch contract for handlers that override
+    /// it, although direct dispatch means Outlet itself no longer combines
+    /// multiple captures into one call.
     fn handle_request_batch(
         &self,
         batch: &[RequestData],
@@ -356,12 +364,14 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of captured HTTP responses.
     ///
-    /// Called by the background task with all responses that have accumulated since
-    /// the last flush. The default implementation clones each item and calls
+    /// Called by the middleware for captured responses. Without an intermediate
+    /// dispatcher, the middleware supplies a singleton batch for each completed
+    /// capture. The default implementation clones each item and calls
     /// [`handle_response`] concurrently via `join_all`.
     ///
-    /// Override this method to perform bulk operations (e.g. batch INSERT)
-    /// that can borrow directly from the slice without cloning.
+    /// The batch hook remains the dispatch contract for handlers that override
+    /// it, although direct dispatch means Outlet itself no longer combines
+    /// multiple captures into one call.
     fn handle_response_batch(
         &self,
         batch: &[(RequestData, ResponseData)],
@@ -377,8 +387,9 @@ pub trait RequestHandler: Send + Sync + 'static {
 
     /// Handle a batch of abandoned requests.
     ///
-    /// Default implementation calls [`handle_abandoned`] for each item
-    /// concurrently. Override for bulk operations.
+    /// Direct dispatch supplies a singleton batch for each abandonment. The
+    /// default implementation calls [`handle_abandoned`] for each item
+    /// concurrently.
     fn handle_abandoned_batch(
         &self,
         batch: &[RequestData],
@@ -397,32 +408,30 @@ type HandlerFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Object-safe adapter used by the non-generic middleware layer.
 trait DynRequestHandler: Send + Sync {
-    fn handle_request(&self, data: RequestData) -> HandlerFuture<'_>;
-    fn handle_response(
-        &self,
-        request_data: RequestData,
-        response_data: ResponseData,
-    ) -> HandlerFuture<'_>;
-    fn handle_abandoned(&self, data: RequestData) -> HandlerFuture<'_>;
+    fn handle_request_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a>;
+    fn handle_response_batch<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> HandlerFuture<'a>;
+    fn handle_abandoned_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a>;
 }
 
 struct RequestHandlerAdapter<H>(H);
 
 impl<H: RequestHandler> DynRequestHandler for RequestHandlerAdapter<H> {
-    fn handle_request(&self, data: RequestData) -> HandlerFuture<'_> {
-        Box::pin(self.0.handle_request(data))
+    fn handle_request_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_request_batch(batch))
     }
 
-    fn handle_response(
-        &self,
-        request_data: RequestData,
-        response_data: ResponseData,
-    ) -> HandlerFuture<'_> {
-        Box::pin(self.0.handle_response(request_data, response_data))
+    fn handle_response_batch<'a>(
+        &'a self,
+        batch: &'a [(RequestData, ResponseData)],
+    ) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_response_batch(batch))
     }
 
-    fn handle_abandoned(&self, data: RequestData) -> HandlerFuture<'_> {
-        Box::pin(self.0.handle_abandoned(data))
+    fn handle_abandoned_batch<'a>(&'a self, batch: &'a [RequestData]) -> HandlerFuture<'a> {
+        Box::pin(self.0.handle_abandoned_batch(batch))
     }
 }
 
@@ -452,7 +461,7 @@ impl Drop for AbandonGuard {
         if let Some(data) = self.data.take() {
             let handler = self.handler.clone();
             tokio::spawn(async move {
-                handler.handle_abandoned(data).await;
+                handler.handle_abandoned_batch(&[data]).await;
             });
         }
     }
@@ -498,7 +507,9 @@ impl RequestLoggerLayer {
     /// Create a new request logger layer with the given configuration and handler.
     ///
     /// Captured request/response data is passed to the handler from the existing
-    /// detached capture tasks, without an intermediate dispatch queue.
+    /// detached capture tasks, without an intermediate dispatch queue. A stalled
+    /// handler therefore retains completed capture tasks rather than dropping
+    /// their data or blocking admission of later requests.
     ///
     /// # Arguments
     ///
@@ -671,7 +682,9 @@ where
 
             let handler_data = request_data.clone();
             tokio::spawn(async move {
-                handler_for_request.handle_request(handler_data).await;
+                handler_for_request
+                    .handle_request_batch(&[handler_data])
+                    .await;
             });
 
             Ok(request_data)
@@ -772,7 +785,7 @@ where
                         };
 
                         handler_for_response
-                            .handle_response(request_data, response_data)
+                            .handle_response_batch(&[(request_data, response_data)])
                             .await;
                     });
 
