@@ -457,6 +457,7 @@ impl<H: RequestHandler> DynRequestHandler for RequestHandlerAdapter<H> {
 struct AbandonGuard {
     handler: Arc<dyn DynRequestHandler>,
     data: Option<RequestData>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl AbandonGuard {
@@ -464,6 +465,7 @@ impl AbandonGuard {
         Self {
             handler,
             data: Some(data),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -476,7 +478,15 @@ impl Drop for AbandonGuard {
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
             let handler = self.handler.clone();
-            tokio::spawn(async move {
+            let runtime = self
+                .runtime
+                .clone()
+                .or_else(|| tokio::runtime::Handle::try_current().ok());
+            let Some(runtime) = runtime else {
+                error!("Unable to dispatch abandoned request outside a Tokio runtime");
+                return;
+            };
+            runtime.spawn(async move {
                 let batch = [data];
                 run_handler(
                     "abandoned_batch",
