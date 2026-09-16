@@ -1,7 +1,7 @@
 //! Data types for captured HTTP request and response information.
 //!
 //! This module contains the core data structures used to represent captured
-//! HTTP requests and responses, along with background task types.
+//! HTTP requests and responses.
 
 use axum::http::{Extensions, Method, StatusCode, Uri};
 use bytes::Bytes;
@@ -83,28 +83,4 @@ pub struct ResponseData {
     /// handlers to receive typed per-request annotations (e.g. routing decisions)
     /// from the layers that produced the response.
     pub extensions: Extensions,
-}
-
-/// Tasks sent to the background processing task.
-///
-/// The middleware sends these tasks to a background async task for processing.
-/// This allows the main request/response flow to continue without blocking.
-///
-/// Users typically don't interact with this type directly.
-#[derive(Debug)]
-pub(crate) enum BackgroundTask {
-    /// A request has been captured and is ready for processing
-    Request { data: RequestData },
-    /// A response has been captured and is ready for processing.
-    /// Contains both the request and response data to provide full context.
-    /// Trace context is available via `request_data.trace_id` and `request_data.span_id`.
-    Response {
-        request_data: RequestData,
-        response_data: ResponseData,
-    },
-    /// The request's handler future was dropped before any response was
-    /// produced — typically because the client cancelled the connection
-    /// while the upstream call was still in flight. Carries the request
-    /// data captured so far so handlers can correlate and clean up.
-    Abandoned { data: RequestData },
 }

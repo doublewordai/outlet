@@ -396,7 +396,7 @@ async fn test_multiple_concurrent_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_queue_backpressures_admission_without_dropping_captures() {
+async fn slow_handler_does_not_block_request_admission_or_drop_captures() {
     use axum::extract::State;
     use tokio::sync::{Notify, Semaphore};
 
@@ -456,26 +456,19 @@ async fn full_queue_backpressures_admission_without_dropping_captures() {
         .await
         .expect("the blocked request handler should start");
 
-    // The first response capture now occupies the only queue slot. A second
-    // request can use the newly released lifecycle slot and still return its
-    // response while its capture waits for the queue.
-    let second = server.get("/counted").await;
+    // Even though one handler call is blocked, subsequent requests and their
+    // captures run independently. `channel_capacity` is retained only for
+    // source compatibility and no longer creates a lossy dispatch boundary.
+    let second = tokio::time::timeout(Duration::from_secs(1), server.get("/counted"))
+        .await
+        .expect("a slow handler must not delay the client response");
     assert_eq!(second.text(), "ok");
 
-    // The second lifecycle holds the sole admission slot, so a third request
-    // cannot create another detached waiter until the handler catches up.
-    let third_server = server.clone();
-    let third = tokio::spawn(async move { third_server.get("/counted").await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(inner_calls.load(Ordering::SeqCst), 2);
-    assert!(!third.is_finished());
-
-    gate.add_permits(1);
-    let third = tokio::time::timeout(Duration::from_secs(2), third)
+    let third = tokio::time::timeout(Duration::from_secs(1), server.get("/counted"))
         .await
-        .expect("third request should be admitted after the queue drains")
-        .unwrap();
+        .expect("a slow handler must not apply request admission backpressure");
     assert_eq!(third.text(), "ok");
+    assert_eq!(inner_calls.load(Ordering::SeqCst), 3);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         while request_count.load(Ordering::SeqCst) < 3 || response_count.load(Ordering::SeqCst) < 3
@@ -484,7 +477,9 @@ async fn full_queue_backpressures_admission_without_dropping_captures() {
         }
     })
     .await
-    .expect("all request and response captures should be delivered");
+    .expect("all request and response captures should be delivered while one handler call is slow");
+
+    gate.add_permits(1);
 }
 
 #[tokio::test]

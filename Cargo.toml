@@ -25,7 +25,6 @@ bytes = "1.5"
 http-body-util = "0.1"
 thiserror = "2.0"
 anyhow = "1.0"
-metrics = "0.24"
 
 [dev-dependencies]
 axum-test = "18.0"
@@ -34,4 +33,3 @@ axum-test = "18.0"
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
-
