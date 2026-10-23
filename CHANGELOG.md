@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/doublewordai/outlet/compare/v0.11.0...v0.11.1) - 2026-10-23
+
+### Fixed
+
+- *(deps)* upgrade OpenTelemetry dependencies ([#108](https://github.com/doublewordai/outlet/pull/108))
+
+### Other
+
+- *(deps)* update rust crate serde_json to v1.0.154 ([#104](https://github.com/doublewordai/outlet/pull/104))
+- *(deps)* update rust crate tower-http to v0.7.1 ([#105](https://github.com/doublewordai/outlet/pull/105))
+- *(deps)* update rust crate http-body-util to v0.1.5 ([#90](https://github.com/doublewordai/outlet/pull/90))
+- *(deps)* update rust crate futures to v0.3.34 ([#95](https://github.com/doublewordai/outlet/pull/95))
+- *(deps)* update rust crate serde to v1.0.229 ([#97](https://github.com/doublewordai/outlet/pull/97))
+- *(deps)* update rust crate tokio to v1.54.1 ([#57](https://github.com/doublewordai/outlet/pull/57))
+- *(deps)* update rust crate anyhow to v1.0.104 ([#96](https://github.com/doublewordai/outlet/pull/96))
+- *(deps)* update actions/checkout action to v7 ([#93](https://github.com/doublewordai/outlet/pull/93))
+- *(deps)* update rust crate thiserror to v2.0.21 ([#98](https://github.com/doublewordai/outlet/pull/98))
+
 ## [0.11.0](https://github.com/doublewordai/outlet/compare/v0.10.0...v0.11.0) - 2026-09-16
 
 ### Fixed
